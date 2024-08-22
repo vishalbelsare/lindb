@@ -21,12 +21,13 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	"github.com/lindb/common/pkg/logger"
+	commontimeutil "github.com/lindb/common/pkg/timeutil"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 
 	"github.com/lindb/lindb/kv"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/pkg/option"
 	"github.com/lindb/lindb/pkg/timeutil"
 )
@@ -45,15 +46,15 @@ func TestSegment_New(t *testing.T) {
 	database := NewMockDatabase(ctrl)
 	database.EXPECT().Name().Return("test").AnyTimes()
 	shard := NewMockShard(ctrl)
-	interval := timeutil.Interval(timeutil.OneSecond * 10)
+	interval := timeutil.Interval(commontimeutil.OneSecond * 10)
 	shard.EXPECT().Database().Return(database).AnyTimes()
 	shard.EXPECT().ShardID().Return(models.ShardID(1)).AnyTimes()
 	shard.EXPECT().CurrentInterval().Return(interval).AnyTimes()
 	segmentName := "20190904"
 	cases := []struct {
+		prepare     func()
 		name        string
 		segmentName string
-		prepare     func()
 		wantErr     bool
 	}{
 		{
@@ -71,7 +72,7 @@ func TestSegment_New(t *testing.T) {
 				database.EXPECT().GetOption().Return(&option.DatabaseOption{
 					Intervals: option.Intervals{
 						{Interval: interval},
-						{Interval: timeutil.Interval(5 * timeutil.OneMinute)},
+						{Interval: timeutil.Interval(5 * commontimeutil.OneMinute)},
 					},
 				})
 				storeMgr.EXPECT().CreateStore(gomock.Any(), gomock.Any()).Return(store, nil)
@@ -109,7 +110,7 @@ func TestSegment_New(t *testing.T) {
 
 			if s != nil {
 				// check base time
-				now, _ := timeutil.ParseTimestamp("20190904 00:00:00", "20060102 15:04:05")
+				now, _ := commontimeutil.ParseTimestamp("20190904 00:00:00", "20060102 15:04:05")
 				assert.Equal(t, now, s.BaseTime())
 			}
 		})
@@ -122,11 +123,11 @@ func TestSegment_GetOrCreateDataFamily(t *testing.T) {
 
 	store := kv.NewMockStore(ctrl)
 	interval := timeutil.Interval(10 * 1000)
-	baseTime, _ := timeutil.ParseTimestamp("20190904 00:00:00", "20060102 15:04:05")
+	baseTime, _ := commontimeutil.ParseTimestamp("20190904 00:00:00", "20060102 15:04:05")
 	cases := []struct {
+		prepare   func(seg *segment)
 		name      string
 		timestamp string
-		prepare   func(seg *segment)
 		wantErr   bool
 	}{
 		{
@@ -140,7 +141,8 @@ func TestSegment_GetOrCreateDataFamily(t *testing.T) {
 			prepare: func(_ *segment) {
 				newDataFamilyFunc = func(shard Shard, _ Segment,
 					interval timeutil.Interval, timeRange timeutil.TimeRange,
-					familyTime int64, family kv.Family) DataFamily {
+					familyTime int64, family kv.Family,
+				) DataFamily {
 					return NewMockDataFamily(ctrl)
 				}
 				store.EXPECT().GetFamily(gomock.Any()).Return(nil)
@@ -153,7 +155,8 @@ func TestSegment_GetOrCreateDataFamily(t *testing.T) {
 			prepare: func(_ *segment) {
 				newDataFamilyFunc = func(shard Shard, _ Segment,
 					interval timeutil.Interval, timeRange timeutil.TimeRange,
-					familyTime int64, family kv.Family) DataFamily {
+					familyTime int64, family kv.Family,
+				) DataFamily {
 					return NewMockDataFamily(ctrl)
 				}
 				store.EXPECT().GetFamily(gomock.Any()).Return(kv.NewMockFamily(ctrl))
@@ -172,7 +175,7 @@ func TestSegment_GetOrCreateDataFamily(t *testing.T) {
 			name:      "get exist family",
 			timestamp: "20190904 22:10:48",
 			prepare: func(seg *segment) {
-				now, _ := timeutil.ParseTimestamp("20190904 22:10:48", "20060102 15:04:05")
+				now, _ := commontimeutil.ParseTimestamp("20190904 22:10:48", "20060102 15:04:05")
 				familyTime := interval.Calculator().CalcFamily(now, seg.baseTime)
 				seg.mutex.Lock()
 				seg.families[familyTime] = NewMockDataFamily(ctrl)
@@ -196,7 +199,7 @@ func TestSegment_GetOrCreateDataFamily(t *testing.T) {
 			if tt.prepare != nil {
 				tt.prepare(seg)
 			}
-			now, _ := timeutil.ParseTimestamp(tt.timestamp, "20060102 15:04:05")
+			now, _ := commontimeutil.ParseTimestamp(tt.timestamp, "20060102 15:04:05")
 			dataFamily, err := seg.GetOrCreateDataFamily(now)
 			if ((err != nil) != tt.wantErr && dataFamily == nil) || (!tt.wantErr && dataFamily == nil) {
 				t.Errorf("GetOrCreateDataFamily() error = %v, wantErr %v", err, tt.wantErr)
@@ -210,15 +213,15 @@ func TestSegment_GetDataFamilies(t *testing.T) {
 	defer ctrl.Finish()
 
 	store := kv.NewMockStore(ctrl)
-	now, _ := timeutil.ParseTimestamp("20220326 10:30:00", "20060102 15:04:05")
+	now, _ := commontimeutil.ParseTimestamp("20220326 10:30:00", "20060102 15:04:05")
 	timeRange := timeutil.TimeRange{
-		Start: now - timeutil.OneHour,
+		Start: now - commontimeutil.OneHour,
 		End:   now,
 	}
 	cases := []struct {
+		prepare   func(seg *segment)
 		name      string
 		timeRange timeutil.TimeRange
-		prepare   func(seg *segment)
 		len       int
 	}{
 		{
@@ -254,7 +257,8 @@ func TestSegment_GetDataFamilies(t *testing.T) {
 				family := kv.NewMockFamily(ctrl)
 				store.EXPECT().GetFamily(gomock.Any()).Return(family)
 				newDataFamilyFunc = func(shard Shard, _ Segment, interval timeutil.Interval,
-					timeRange timeutil.TimeRange, familyTime int64, family kv.Family) DataFamily {
+					timeRange timeutil.TimeRange, familyTime int64, family kv.Family,
+				) DataFamily {
 					return dataFamily
 				}
 				store.EXPECT().ListFamilyNames().Return([]string{"10"})
@@ -301,8 +305,8 @@ func TestSegment_Close(t *testing.T) {
 		seg.mutex.Unlock()
 	}
 	cases := []struct {
-		name    string
 		prepare func()
+		name    string
 	}{
 		{
 			name: "no family",
@@ -356,5 +360,5 @@ func TestSegment_NeedEvict(t *testing.T) {
 	interval := timeutil.Interval(10 * 1000)
 	s := &segment{interval: interval}
 	assert.True(t, s.NeedEvict())
-	s.EvictFamily(timeutil.Now())
+	s.EvictFamily(commontimeutil.Now())
 }

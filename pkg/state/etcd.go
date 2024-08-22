@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/timeutil"
 	etcdcliv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
 	"go.uber.org/zap"
@@ -33,15 +35,13 @@ import (
 
 	"github.com/lindb/lindb/config"
 	"github.com/lindb/lindb/constants"
-	"github.com/lindb/lindb/pkg/logger"
-	"github.com/lindb/lindb/pkg/timeutil"
 )
 
 // etcdRepository is repository based on etcd storage
 type etcdRepository struct {
-	namespace string
+	logger    logger.Logger
 	client    *etcdcliv3.Client
-	logger    *logger.Logger
+	namespace string
 	timeout   time.Duration
 }
 
@@ -68,7 +68,8 @@ func newEtcdRepository(repoState *config.RepoState, owner string) (Repository, e
 		namespace: repoState.Namespace,
 		client:    cli,
 		timeout:   repoState.Timeout.Duration(),
-		logger:    logger.GetLogger(owner, "ETCD")}
+		logger:    logger.GetLogger(owner, "ETCD"),
+	}
 
 	repo.logger.Info("new etcd client successfully",
 		logger.Any("endpoints", repoState.Endpoints))
@@ -348,7 +349,7 @@ func (r *etcdRepository) NextSequence(ctx context.Context, key string) (int64, e
 
 // keyPath return new key path with namespace prefix
 func (r *etcdRepository) keyPath(key string) string {
-	if len(r.namespace) > 0 {
+	if r.namespace != "" {
 		newKey := r.namespace + constants.StatePathSeparator + key
 		// maybe namespace end with separator or key start with separator
 		return strings.ReplaceAll(newKey,
@@ -367,9 +368,9 @@ func (r *etcdRepository) parseKey(key string) string {
 }
 
 type transaction struct {
+	repo *etcdRepository
 	ops  []etcdcliv3.Op
 	cmps []etcdcliv3.Cmp
-	repo *etcdRepository
 }
 
 func newTransaction(repo *etcdRepository) Transaction {

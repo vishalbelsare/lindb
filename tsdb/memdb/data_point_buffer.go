@@ -22,11 +22,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
+	commonfileutil "github.com/lindb/common/pkg/fileutil"
+	"github.com/lindb/common/pkg/logger"
 	"go.uber.org/atomic"
 
 	"github.com/lindb/lindb/pkg/fileutil"
-	"github.com/lindb/lindb/pkg/logger"
+	"github.com/lindb/lindb/pkg/imap"
 )
 
 //go:generate mockgen -source ./data_point_buffer.go -destination=./data_point_buffer_mock.go -package memdb
@@ -34,14 +37,15 @@ import (
 // for testing
 var (
 	closeFileFunc = closeFile
-	mkdirFunc     = fileutil.MkDirIfNotExist
+	mkdirFunc     = commonfileutil.MkDirIfNotExist
 	mapFunc       = fileutil.RWMap
 	unmapFunc     = fileutil.Unmap
-	removeFunc    = fileutil.RemoveDir
+	removeFunc    = commonfileutil.RemoveDir
 	openFileFunc  = os.OpenFile
 )
 
 const (
+	// TODO: add db config
 	regionSize = 128 * 1024 * 1024 // 128M
 	pageSize   = 128
 	pageCount  = regionSize / pageSize
@@ -50,21 +54,27 @@ const (
 // DataPointBuffer represents data point buffer write buffer based on memory map file
 type DataPointBuffer interface {
 	io.Closer
-	// AllocPage allocates the page buffer for writing data point.
-	AllocPage() (buf []byte, err error)
+	// GetOrCreatePage returns write page buffer, if not exist create new page buffer.
+	GetOrCreatePage(memSeriesID uint32) ([]byte, error)
+	// GetPage returns write page buffer, if not exist returns nil.
+	GetPage(memSeriesID uint32) ([]byte, bool)
 	// Release marks data point buffer is dirty.
 	Release()
 	// IsDirty returns data point buffer if dirty, dirty buffer can be collect.
 	IsDirty() bool
+	// BufferSize returns data point buffer size.
+	BufferSize() int64
 }
 
 // dataPointBuffer implements DataPointBuffer interface
 type dataPointBuffer struct {
+	ids       *imap.IntMap[int32] // store all time series ids(memory time series id => page id)
 	path      string
 	buf       [][]byte
 	files     []*os.File
-	pageIDSeq atomic.Int32
 	dirty     atomic.Bool
+	lock      sync.RWMutex
+	pageIDSeq int32
 }
 
 // newDataPointBuffer creates data point buffer for writing points of metric.
@@ -74,18 +84,34 @@ func newDataPointBuffer(path string) (DataPointBuffer, error) {
 	}
 	return &dataPointBuffer{
 		path:      path,
-		pageIDSeq: *atomic.NewInt32(-1),
+		pageIDSeq: 0,
+		ids:       imap.NewIntMap[int32](),
 	}, nil
 }
 
-// AllocPage allocates the page buffer for writing data point
-func (d *dataPointBuffer) AllocPage() (buf []byte, err error) {
-	pageID := d.pageIDSeq.Inc()
-	if pageID%pageCount == 0 {
+// GetOrCreatePage returns write page buffer, if not exist create new page buffer.
+func (d *dataPointBuffer) GetOrCreatePage(memSeriesID uint32) ([]byte, error) {
+	var (
+		pageID int32
+		ok     bool
+	)
+
+	d.lock.RLock()
+	pageID, ok = d.ids.Get(memSeriesID)
+	d.lock.RUnlock()
+	if !ok {
+		// generate a new page id
+		// NOTE: single goroutine write family data, so can read directly
+		pageID = d.pageIDSeq
+	}
+	region := pageID / pageCount
+	rOffset := pageID % pageCount
+	if !ok && rOffset == 0 {
+		// if page id is new and region not found, then create a new temp region buffer
 		if err := mkdirFunc(d.path); err != nil {
 			return nil, err
 		}
-		f, err := openFileFunc(filepath.Join(d.path, fmt.Sprintf("%d.tmp", pageID/pageCount)), os.O_CREATE|os.O_RDWR, 0644)
+		f, err := openFileFunc(filepath.Join(d.path, fmt.Sprintf("%d.tmp", region)), os.O_CREATE|os.O_RDWR, 0644)
 		if err != nil {
 			return nil, err
 		}
@@ -97,12 +123,36 @@ func (d *dataPointBuffer) AllocPage() (buf []byte, err error) {
 		d.files = append(d.files, f)
 		d.buf = append(d.buf, buf)
 	}
-	region := uint16(pageID / pageCount)
-	if d.buf == nil || uint16(len(d.buf)) <= region {
-		return nil, fmt.Errorf("wrong region in memory buffer")
+	offset := pageSize * rOffset
+
+	if !ok {
+		d.lock.Lock()
+		d.ids.PutIfNotExist(memSeriesID, pageID)
+		d.lock.Unlock()
+
+		// increase page id sequence if all operators successfully
+		d.pageIDSeq++
 	}
-	offset := pageSize * (int(pageID) % pageCount)
 	return d.buf[region][offset : offset+pageSize], nil
+}
+
+// GetPage returns write page buffer, if not exist returns nil.
+func (d *dataPointBuffer) GetPage(memSeriesID uint32) ([]byte, bool) {
+	var (
+		pageID int32
+		ok     bool
+	)
+	d.lock.RLock()
+	pageID, ok = d.ids.Get(memSeriesID) // find page id by memory time series
+	d.lock.RUnlock()
+
+	if !ok {
+		return nil, false
+	}
+	region := pageID / pageCount
+	rOffset := pageID % pageCount
+	offset := pageSize * rOffset
+	return d.buf[region][offset : offset+pageSize], true
 }
 
 // Release marks data point buffer is dirty.
@@ -113,6 +163,11 @@ func (d *dataPointBuffer) Release() {
 // IsDirty returns data point buffer if dirty, dirty buffer can be collect.
 func (d *dataPointBuffer) IsDirty() bool {
 	return d.dirty.Load()
+}
+
+// BufferSize returns data point buffer size.
+func (d *dataPointBuffer) BufferSize() int64 {
+	return int64(d.pageIDSeq) * pageSize
 }
 
 // Close closes data point buffer, unmap memory map file

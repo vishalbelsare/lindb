@@ -18,11 +18,11 @@
 package replica
 
 import (
-	"github.com/golang/snappy"
+	"github.com/lindb/common/pkg/logger"
 
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/logger"
+	"github.com/lindb/lindb/pkg/compress"
 	"github.com/lindb/lindb/series/metric"
 	"github.com/lindb/lindb/tsdb"
 )
@@ -30,16 +30,13 @@ import (
 // localReplicator represents local replicator which writes data into local tsdb storage.
 type localReplicator struct {
 	replicator
-
-	leader    int32
-	shard     tsdb.Shard
-	family    tsdb.DataFamily
-	logger    *logger.Logger
-	batchRows *metric.StorageBatchRows
-
-	block []byte
-
+	shard      tsdb.Shard
+	family     tsdb.DataFamily
+	logger     logger.Logger
+	batchRows  *metric.StorageBatchRows
+	reader     compress.Reader
 	statistics *metrics.StorageLocalReplicatorStatistics
+	leader     int32
 }
 
 func NewLocalReplicator(channel *ReplicatorChannel, shard tsdb.Shard, family tsdb.DataFamily) Replicator {
@@ -50,10 +47,10 @@ func NewLocalReplicator(channel *ReplicatorChannel, shard tsdb.Shard, family tsd
 		},
 		shard:      shard,
 		family:     family,
+		reader:     compress.NewSnappyReader(),
 		batchRows:  metric.NewStorageBatchRows(),
 		statistics: metrics.NewStorageLocalReplicatorStatistics(channel.State.Database, channel.State.ShardID.String()),
 		logger:     logger.GetLogger("Replica", "LocalReplicator"),
-		block:      make([]byte, 256*1024),
 	}
 
 	// add ack sequence callback
@@ -80,14 +77,14 @@ func (r *localReplicator) State() *state {
 	return &state{state: models.ReplicatorReadyState}
 }
 
-// Replica replicas local data,
+// Replica replicas local data into local storage,
 // 1. check replica replica if valid
 // 2. un-compress/unmarshal msg
-// 3. lookup metadata
-// 4. write metric data
-// 5. commit sequence in data family
+// 3. write metric data
+// 4. commit sequence in data family
 func (r *localReplicator) Replica(sequence int64, msg []byte) {
 	var err error
+	var block []byte
 
 	if !r.family.ValidateSequence(r.leader, sequence) {
 		r.statistics.InvalidSequence.Incr()
@@ -104,14 +101,12 @@ func (r *localReplicator) Replica(sequence int64, msg []byte) {
 				logger.String("replicator", r.String()),
 				logger.Error(err))
 		}
-		r.block = r.block[:0]
 
 		// after write need commit sequence, drop write failure data.
 		r.family.CommitSequence(r.leader, sequence)
 	}()
 
-	// TODO: add util
-	r.block, err = snappy.Decode(r.block, msg)
+	block, err = r.reader.Uncompress(msg)
 	if err != nil {
 		r.statistics.DecompressFailures.Incr()
 		r.logger.Error("decompress replica data error",
@@ -122,25 +117,14 @@ func (r *localReplicator) Replica(sequence int64, msg []byte) {
 		return
 	}
 
-	r.batchRows.UnmarshalRows(r.block)
+	r.batchRows.UnmarshalRows(block)
 	rowsLen := r.batchRows.Len()
+
 	if rowsLen == 0 {
 		return
 	}
-	rows := r.batchRows.Rows()
-
-	// lookup metric metadata
-	if err := r.shard.LookupRowMetricMeta(rows); err != nil {
-		r.statistics.ReplicaFailures.Incr()
-		r.logger.Error("failed lookup row metric meta",
-			logger.Int64("sequence", sequence),
-			logger.Int("rows", r.batchRows.Len()),
-			logger.String("replicator", r.String()),
-			logger.Error(err))
-		return
-	}
 	// write metric data
-	if err := r.family.WriteRows(rows); err != nil {
+	if err := r.family.WriteRows(r.batchRows.Rows()); err != nil {
 		r.statistics.ReplicaFailures.Incr()
 		r.logger.Error("failed writing family rows",
 			logger.Int64("sequence", sequence),

@@ -20,16 +20,17 @@ package replica
 import (
 	"fmt"
 
+	"github.com/lindb/common/pkg/timeutil"
+
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/timeutil"
 )
 
 //go:generate mockgen -source=./replicator.go -destination=./replicator_mock.go -package=replica
 
 // state represents the state of replicator.
 type state struct {
-	state  models.ReplicatorState
 	errMsg string
+	state  models.ReplicatorState
 }
 
 // Replicator represents write ahead log replicator.

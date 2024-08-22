@@ -21,14 +21,14 @@ import (
 	"context"
 	"sync"
 
+	"github.com/lindb/common/pkg/encoding"
+	"github.com/lindb/common/pkg/logger"
 	"go.uber.org/atomic"
 
 	"github.com/lindb/lindb/constants"
 	"github.com/lindb/lindb/coordinator/storage"
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/encoding"
-	"github.com/lindb/lindb/pkg/logger"
 	protoReplicaV1 "github.com/lindb/lindb/proto/gen/v1/replica"
 	"github.com/lindb/lindb/rpc"
 )
@@ -36,7 +36,6 @@ import (
 // remoteReplicator implements Replicator interface, do remote wal replica.
 type remoteReplicator struct {
 	replicator
-
 	ctx   context.Context
 	state atomic.Value // ref: state
 
@@ -44,14 +43,11 @@ type remoteReplicator struct {
 	replicaCli    protoReplicaV1.ReplicaServiceClient
 	replicaStream protoReplicaV1.ReplicaService_ReplicaClient
 	stateMgr      storage.StateManager
-
-	isSuspend *atomic.Bool
-	suspend   chan struct{}
-
-	rwMutex sync.RWMutex
-
-	statistics *metrics.StorageRemoteReplicatorStatistics
-	logger     *logger.Logger
+	logger        logger.Logger
+	isSuspend     *atomic.Bool
+	suspend       chan struct{}
+	statistics    *metrics.StorageRemoteReplicatorStatistics
+	rwMutex       sync.RWMutex
 }
 
 // NewRemoteReplicator creates remote replicator.
@@ -89,7 +85,7 @@ func (r *remoteReplicator) State() *state {
 
 func (r *remoteReplicator) handleNodeStateChangeEvent(state models.NodeStateType) {
 	if state == models.NodeOnline {
-		if r.isSuspend.CAS(true, false) {
+		if r.isSuspend.CompareAndSwap(true, false) {
 			r.logger.Info("notify replicator follower node is online", logger.String("replicator", r.String()))
 			r.suspend <- struct{}{} // notify follower node online
 		}
@@ -146,7 +142,7 @@ func (r *remoteReplicator) IsReady() bool {
 		r.logger.Warn("follower node is offline, need suspend replicator", logger.String("replicator", r.String()))
 
 		r.rwMutex.Unlock() // unlock
-		if r.isSuspend.CAS(false, true) {
+		if r.isSuspend.CompareAndSwap(false, true) {
 			r.statistics.FollowerOffline.Incr()
 			r.state.Store(&state{state: models.ReplicatorFailureState, errMsg: "follower node is offline"})
 			<-r.suspend // wait follower node online
@@ -215,8 +211,10 @@ func (r *remoteReplicator) IsReady() bool {
 			r.logger.Warn("do reset replica append index err",
 				logger.String("replicator", r.String()),
 				logger.Error(err))
-			r.state.Store(&state{state: models.ReplicatorFailureState,
-				errMsg: "reset replica append index failure, root cause: " + err.Error()})
+			r.state.Store(&state{
+				state:  models.ReplicatorFailureState,
+				errMsg: "reset replica append index failure, root cause: " + err.Error(),
+			})
 			return false
 		}
 		r.statistics.ResetFollowerAppendIdx.Incr()
@@ -284,6 +282,7 @@ func (r *remoteReplicator) Replica(idx int64, msg []byte) {
 		logger.String("replicator", r.String()),
 		logger.Int64("replicaIdx", resp.ReplicaIndex),
 		logger.Int64("ackIdx", resp.AckIndex))
+	// FIXME: need check resp err
 	if resp.AckIndex == resp.ReplicaIndex {
 		// if ack index = replica, need ack wal
 		r.SetAckIndex(resp.AckIndex)

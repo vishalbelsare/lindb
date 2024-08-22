@@ -23,6 +23,7 @@ import (
 	"strconv"
 
 	"github.com/lindb/common/pkg/fasttime"
+	"github.com/lindb/common/pkg/timeutil"
 	"github.com/lindb/common/proto/gen/v1/flatMetricsV1"
 	commonseries "github.com/lindb/common/series"
 
@@ -30,7 +31,6 @@ import (
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
 	"github.com/lindb/lindb/pkg/strutil"
-	"github.com/lindb/lindb/pkg/timeutil"
 )
 
 var (
@@ -41,9 +41,7 @@ var (
 	ErrBadTimestamp      = errors.New("bad_timestamp")
 )
 
-var (
-	influxIngestionStatistics = metrics.NewInfluxIngestionStatistics()
-)
+var influxIngestionStatistics = metrics.NewInfluxIngestionStatistics()
 
 // Test cases in
 // https://github.com/influxdata/influxdb/blob/master/models/points_test.go
@@ -108,7 +106,7 @@ func parseInfluxLine(
 	if err != nil && len(fields) == 0 {
 		return err
 	}
-	if limits.EnableFieldsCheck() && len(fields) > int(limits.MaxFieldsPerMetric) {
+	if limits.EnableFieldsCheck() && len(fields) > limits.MaxFieldsPerMetric {
 		return constants.ErrTooManyFields
 	}
 	for idx := range fields {

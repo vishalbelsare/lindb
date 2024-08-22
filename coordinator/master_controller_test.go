@@ -22,15 +22,15 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	"github.com/lindb/common/pkg/encoding"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 
 	"github.com/lindb/lindb/coordinator/discovery"
 	"github.com/lindb/lindb/coordinator/elect"
 	masterpkg "github.com/lindb/lindb/coordinator/master"
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/encoding"
 	"github.com/lindb/lindb/pkg/state"
 )
 
@@ -41,6 +41,7 @@ func TestNewMasterController(t *testing.T) {
 	disFct := discovery.NewMockFactory(ctrl)
 	cfg := &MasterCfg{
 		Ctx:              context.TODO(),
+		Node:             &models.StatelessNode{HostIP: "127.0.0.1", GRPCPort: 2080},
 		DiscoveryFactory: disFct,
 	}
 
@@ -63,14 +64,15 @@ func TestMasterController_OnFailOver(t *testing.T) {
 	stateMgr.EXPECT().Close().AnyTimes()
 	stateMgr.EXPECT().SetStateMachineFactory(gomock.Any()).AnyTimes()
 	newStateMgrFn = func(ctx context.Context, masterRepo state.Repository,
-		repoFactory state.RepositoryFactory) masterpkg.StateManager {
+		repoFactory state.RepositoryFactory,
+	) masterpkg.StateManager {
 		return stateMgr
 	}
 	registry := discovery.NewMockRegistry(ctrl)
 
 	cases := []struct {
-		name    string
 		prepare func()
+		name    string
 		wantErr bool
 	}{
 		{
@@ -84,7 +86,7 @@ func TestMasterController_OnFailOver(t *testing.T) {
 			name: "register master done failure",
 			prepare: func() {
 				discovery1.EXPECT().Discovery(gomock.Any()).Return(nil).MaxTimes(4)
-				registry.EXPECT().Register(gomock.Any()).Return(fmt.Errorf("err"))
+				registry.EXPECT().Register().Return(fmt.Errorf("err"))
 			},
 			wantErr: true,
 		},
@@ -92,7 +94,7 @@ func TestMasterController_OnFailOver(t *testing.T) {
 			name: "elect master successfully",
 			prepare: func() {
 				discovery1.EXPECT().Discovery(gomock.Any()).Return(nil).MaxTimes(4)
-				registry.EXPECT().Register(gomock.Any()).Return(nil)
+				registry.EXPECT().Register().Return(nil)
 			},
 			wantErr: false,
 		},
@@ -104,6 +106,7 @@ func TestMasterController_OnFailOver(t *testing.T) {
 			mc := &masterController{
 				ctx: context.TODO(),
 				cfg: &MasterCfg{
+					Node:             &models.StatelessNode{HostIP: "127.0.0.1", GRPCPort: 2080},
 					DiscoveryFactory: discoveryFactory,
 				},
 				registry:   registry,
@@ -142,10 +145,10 @@ func TestMasterController_OnResignation(t *testing.T) {
 		statistics:      metrics.NewMasterStatistics(),
 	}
 	// resign failure
-	registry.EXPECT().Deregister(gomock.Any()).Return(fmt.Errorf("err"))
+	registry.EXPECT().Deregister().Return(fmt.Errorf("err"))
 	mc.OnResignation()
 	// resign successfully
-	registry.EXPECT().Deregister(gomock.Any()).Return(nil)
+	registry.EXPECT().Deregister().Return(nil)
 	mc.OnResignation()
 }
 
@@ -215,8 +218,8 @@ func TestMasterController_FlushDatabase(t *testing.T) {
 	masterElect := elect.NewMockElection(ctrl)
 	stateMgr := masterpkg.NewMockStateManager(ctrl)
 	cases := []struct {
-		name    string
 		prepare func()
+		name    string
 		wantErr bool
 	}{
 		{
@@ -230,7 +233,7 @@ func TestMasterController_FlushDatabase(t *testing.T) {
 			name: "storage not found",
 			prepare: func() {
 				masterElect.EXPECT().IsMaster().Return(true)
-				stateMgr.EXPECT().GetStorageCluster("test").Return(nil)
+				stateMgr.EXPECT().GetStorageCluster().Return(nil)
 			},
 			wantErr: true,
 		},
@@ -239,7 +242,7 @@ func TestMasterController_FlushDatabase(t *testing.T) {
 			prepare: func() {
 				masterElect.EXPECT().IsMaster().Return(true)
 				storage := masterpkg.NewMockStorageCluster(ctrl)
-				stateMgr.EXPECT().GetStorageCluster("test").Return(storage)
+				stateMgr.EXPECT().GetStorageCluster().Return(storage)
 				storage.EXPECT().FlushDatabase("db").Return(nil)
 			},
 			wantErr: false,

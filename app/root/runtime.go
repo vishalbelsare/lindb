@@ -24,6 +24,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/timeutil"
+
 	"github.com/lindb/lindb/app"
 	"github.com/lindb/lindb/app/root/api"
 	depspkg "github.com/lindb/lindb/app/root/deps"
@@ -38,9 +41,7 @@ import (
 	"github.com/lindb/lindb/models"
 	"github.com/lindb/lindb/pkg/hostutil"
 	httppkg "github.com/lindb/lindb/pkg/http"
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/pkg/state"
-	"github.com/lindb/lindb/pkg/timeutil"
 	"github.com/lindb/lindb/query"
 	"github.com/lindb/lindb/rpc"
 	"github.com/lindb/lindb/series/tag"
@@ -92,7 +93,7 @@ type runtime struct {
 
 	globalKeyValues tag.Tags
 
-	logger *logger.Logger
+	logger logger.Logger
 }
 
 // NewRootRuntime creates the root runtime.
@@ -168,7 +169,7 @@ func (r *runtime) Run() error {
 		return err
 	}
 	// register root node info
-	r.registry = newRegistry(r.repo, constants.LiveNodesPath, r.config.Coordinator.LeaseTTL.Duration())
+	r.registry = newRegistry(r.repo, constants.GetLiveNodePath(r.node.Indicator()), r.node, r.config.Coordinator.LeaseTTL.Duration())
 
 	if err = r.MustRegisterStatelessNode(); err != nil {
 		r.state = server.Failed
@@ -196,7 +197,7 @@ func (r *runtime) Run() error {
 
 // MustRegisterStatelessNode make sure root node is registered to etcd.
 func (r *runtime) MustRegisterStatelessNode() error {
-	if err := r.registry.Register(r.node); err != nil {
+	if err := r.registry.Register(); err != nil {
 		return fmt.Errorf("register root node error:%s", err)
 	}
 	// sometimes lease isn't expired when storage restarts, retry registering is necessary
@@ -234,7 +235,7 @@ func (r *runtime) Stop() {
 	// close registry, deregister root node from active list
 	if r.registry != nil {
 		r.logger.Info("closing discovery-registry...")
-		if err := r.registry.Deregister(r.node); err != nil {
+		if err := r.registry.Deregister(); err != nil {
 			r.logger.Error("unregister root node error", logger.Error(err))
 		}
 		if err := r.registry.Close(); err != nil {

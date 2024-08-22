@@ -25,14 +25,14 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/lindb/common/pkg/fileutil"
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/ltoml"
 	"go.uber.org/atomic"
 
 	"github.com/lindb/lindb/kv/table"
 	"github.com/lindb/lindb/kv/version"
-	"github.com/lindb/lindb/pkg/fileutil"
 	"github.com/lindb/lindb/pkg/lockers"
-	"github.com/lindb/lindb/pkg/logger"
-	"github.com/lindb/lindb/pkg/ltoml"
 )
 
 //go:generate mockgen -source ./store.go -destination=./store_mock.go -package kv
@@ -85,23 +85,18 @@ type Store interface {
 
 // store implements Store interface
 type store struct {
-	name   string
-	path   string
-	option StoreOption
-	// file-lock restricts access to store by allowing only one instance
-	lock     lockers.FileLock
-	versions version.StoreVersionSet
-	// each family instance need to be assigned a unique family id
-	familySeq atomic.Int32
-	families  map[string]Family // family name => family
-	// RWMutex for accessing family
-	rwMutex sync.RWMutex
-
-	storeInfo *storeInfo
+	lock      lockers.FileLock
+	versions  version.StoreVersionSet
 	cache     table.Cache
-
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx       context.Context
+	families  map[string]Family
+	storeInfo *storeInfo
+	cancel    context.CancelFunc
+	name      string
+	path      string
+	option    StoreOption
+	familySeq atomic.Int32
+	rwMutex   sync.RWMutex
 }
 
 // newStore news store instance, need recover data if store existent

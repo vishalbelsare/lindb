@@ -22,10 +22,11 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/lindb/common/pkg/encoding"
+	"github.com/lindb/common/pkg/logger"
+
 	"github.com/lindb/lindb/config"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/encoding"
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/pkg/option"
 )
 
@@ -69,11 +70,11 @@ type Engine interface {
 
 // engine implements Engine
 type engine struct {
-	mutex            sync.Mutex         // mutex for creating database
 	dbSet            databaseSet        // atomic value, holding databaseName -> Database
 	ctx              context.Context    // context
 	cancel           context.CancelFunc // cancel function of flusher
 	dataFlushChecker DataFlushChecker
+	mutex            sync.Mutex // mutex for creating database
 }
 
 // NewEngine creates an engine for manipulating the databases
@@ -103,7 +104,7 @@ func NewEngine() (Engine, error) {
 // return success when creating database's path successfully
 func (e *engine) createDatabase(databaseName string, dbOption *option.DatabaseOption) (Database, error) {
 	cfgPath := optionsPath(databaseName)
-	cfg := &models.DatabaseConfig{Option: dbOption}
+	cfg := &models.DatabaseConfig{Name: databaseName, Option: dbOption}
 	engineLogger.Info("load database option from local storage", logger.String("path", cfgPath))
 	if fileExist(cfgPath) {
 		if err := decodeToml(cfgPath, cfg); err != nil {

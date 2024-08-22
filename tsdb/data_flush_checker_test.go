@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 
 	"github.com/lindb/lindb/config"
 	"github.com/lindb/lindb/models"
@@ -83,9 +83,9 @@ func TestDataFamilyCheck_check(t *testing.T) {
 	family2.EXPECT().Shard().Return(shard).AnyTimes()
 
 	cases := []struct {
-		name    string
 		prepare func(c *dataFlushChecker)
 		assert  func(c *dataFlushChecker)
+		name    string
 	}{
 		{
 			name: "no family",
@@ -221,9 +221,9 @@ func TestDataFlushChecker_requestFlush(t *testing.T) {
 	db := NewMockDatabase(ctrl)
 	db.EXPECT().Name().Return("db").AnyTimes()
 	cases := []struct {
-		name    string
 		prepare func(c *dataFlushChecker)
 		assert  func(c *dataFlushChecker)
+		name    string
 	}{
 		{
 			name: "not running",
@@ -334,8 +334,8 @@ func TestDataFlushChecker_doFlush(t *testing.T) {
 	bufMgr.EXPECT().GarbageCollect().AnyTimes()
 
 	cases := []struct {
-		name    string
 		prepare func(c *dataFlushChecker)
+		name    string
 	}{
 		{
 			name: "flush meta db failure",

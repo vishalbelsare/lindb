@@ -62,16 +62,15 @@ type MetricReader interface {
 
 // metricReader implements MetricReader interface that reads metric block
 type metricReader struct {
-	path           string
-	metricBlock    []byte
-	seriesBucket   []byte
-	highKeyOffsets *encoding.FixedOffsetDecoder
-	seriesIDs      *roaring.Bitmap
-	fields         field.Metas
-	crc32CheckSum  uint32
-	timeRange      timeutil.SlotRange
-
-	readFieldIndexes []int // read field indexes be used when query metric data
+	highKeyOffsets   *encoding.FixedOffsetDecoder
+	seriesIDs        *roaring.Bitmap
+	path             string
+	metricBlock      []byte
+	seriesBucket     []byte
+	fields           field.Metas
+	readFieldIndexes []int
+	crc32CheckSum    uint32
+	timeRange        timeutil.SlotRange
 }
 
 // NewReader creates a metric block metricReader
@@ -242,7 +241,7 @@ func (r *metricReader) initReader() error {
 	}
 	// read series ids
 	seriesIDs := roaring.New()
-	if err := encoding.BitmapUnmarshal(seriesIDs, r.metricBlock[seriesIDsStartPos:]); err != nil {
+	if _, err := encoding.BitmapUnmarshal(seriesIDs, r.metricBlock[seriesIDsStartPos:]); err != nil {
 		return err
 	}
 	r.seriesBucket = r.metricBlock[:fieldMetaStartPos]

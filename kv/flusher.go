@@ -42,20 +42,19 @@ type Flusher interface {
 	// Commit flushes data and commits metadata.
 	Commit() error
 	// Release releases the resource of flusher.
-	// NOTICE: MUST invoke Release() after new fluster instance.
+	// NOTE: MUST invoke Release() after new fluster instance.
 	Release()
 }
 
 // storeFlusher is family level store flusher.
 type storeFlusher struct {
+	start     time.Time
 	family    Family
-	sequences map[int32]int64
 	builder   table.Builder
 	editLog   version.EditLog
-	outputs   []table.FileNumber
-	start     time.Time
-
+	sequences map[int32]int64
 	releaseFn func()
+	outputs   []table.FileNumber
 }
 
 // newStoreFlusher create family store flusher.
@@ -120,13 +119,21 @@ func (sf *storeFlusher) Commit() (err error) {
 		}
 	}()
 	if builder != nil {
-		err = builder.Close()
-		if err != nil {
-			return fmt.Errorf("close table builder error when flush commit, error:%s", err)
-		}
+		if builder.Size() > 0 {
+			err = builder.Close()
+			if err != nil {
+				return fmt.Errorf("close table builder error when flush commit, error:%s", err)
+			}
 
-		fileMeta := version.NewFileMeta(builder.FileNumber(), builder.MinKey(), builder.MaxKey(), builder.Size())
-		sf.editLog.Add(version.CreateNewFile(0, fileMeta))
+			fileMeta := version.NewFileMeta(builder.FileNumber(), builder.MinKey(), builder.MaxKey(), builder.Size())
+			sf.editLog.Add(version.CreateNewFile(0, fileMeta))
+		} else {
+			// if no keys, abandon kv builder
+			err = builder.Abandon()
+			if err != nil {
+				return fmt.Errorf("abandon table builder error when flush commit, error:%s", err)
+			}
+		}
 	}
 	for leader, seq := range sf.sequences {
 		// add sequence for each leader
@@ -145,6 +152,7 @@ func (sf *storeFlusher) Commit() (err error) {
 		}
 	}
 
+	// TODO: check if edit log is empty?
 	if flag := sf.family.commitEditLog(sf.editLog); !flag {
 		err = fmt.Errorf("commit edit log failure")
 		return err
@@ -197,9 +205,9 @@ func (nf *NopFlusher) Commit() error {
 func (nf *NopFlusher) Release() {}
 
 type nopStreamWriter struct {
-	size   uint32
-	buffer *bytes.Buffer
 	crc32  hash.Hash32
+	buffer *bytes.Buffer
+	size   uint32
 }
 
 func (nw *nopStreamWriter) Prepare(_ uint32) {

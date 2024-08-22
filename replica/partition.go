@@ -23,12 +23,15 @@ import (
 	"io"
 	"sync"
 
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/timeutil"
+	"go.uber.org/atomic"
+
+	"github.com/lindb/lindb/constants"
 	"github.com/lindb/lindb/coordinator/storage"
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/pkg/queue"
-	"github.com/lindb/lindb/pkg/timeutil"
 	"github.com/lindb/lindb/rpc"
 	"github.com/lindb/lindb/tsdb"
 )
@@ -39,7 +42,11 @@ var (
 	// for testing
 	newLocalReplicatorFn  = NewLocalReplicator
 	newRemoteReplicatorFn = NewRemoteReplicator
-	newReplicatorPeerFn   = NewReplicatorPeer
+)
+
+const (
+	replicatorTypeLocal  = "local"
+	replicatorTypeRemote = "remote"
 )
 
 // Partition represents a partition of writeTask ahead log.
@@ -66,30 +73,35 @@ type Partition interface {
 	Stop()
 	// getReplicaState returns each family's log replica state.
 	getReplicaState() models.FamilyLogReplicaState
+	// StartReplica iterates over all replicators and copies data.
+	StartReplica()
+	// replicaLoop starts replica loop
+	replicaLoop()
+	// replica tries to consume message
+	replica(nodeID models.NodeID, replicator Replicator)
 	// recovery rebuilds replication relation based on local partition.
 	recovery(leader models.NodeID) error
 }
 
 // partition implements Partition interface.
 type partition struct {
-	ctx           context.Context
-	cancel        context.CancelFunc
-	currentNodeID models.NodeID
-	db            string
-	log           queue.FanOutQueue
-	shardID       models.ShardID
-	shard         tsdb.Shard
-	family        tsdb.DataFamily
-
-	peers    map[models.NodeID]ReplicatorPeer
-	cliFct   rpc.ClientStreamFactory
-	stateMgr storage.StateManager
-
-	mutex sync.Mutex
-
-	statistics *metrics.StorageWriteAheadLogStatistics
-
-	logger *logger.Logger
+	stateMgr             storage.StateManager
+	logger               logger.Logger
+	ctx                  context.Context
+	cliFct               rpc.ClientStreamFactory
+	family               tsdb.DataFamily
+	log                  queue.FanOutQueue
+	shard                tsdb.Shard
+	closed               *atomic.Bool
+	replicators          map[models.NodeID]Replicator
+	cancel               context.CancelFunc
+	statistics           *metrics.StorageWriteAheadLogStatistics
+	running              *atomic.Bool
+	replicatorStatistics map[models.NodeID]*metrics.StorageReplicatorRunnerStatistics
+	db                   string
+	shardID              models.ShardID
+	currentNodeID        models.NodeID
+	mutex                sync.Mutex
 }
 
 // NewPartition creates a writeTask ahead log partition(db+shard+family time+leader).
@@ -103,26 +115,33 @@ func NewPartition(
 	stateMgr storage.StateManager,
 ) Partition {
 	c, cancel := context.WithCancel(ctx)
-	return &partition{
-		ctx:           c,
-		cancel:        cancel,
-		log:           log,
-		db:            shard.Database().Name(),
-		shardID:       shard.ShardID(),
-		shard:         shard,
-		family:        family,
-		currentNodeID: currentNodeID,
-		cliFct:        cliFct,
-		stateMgr:      stateMgr,
-		peers:         make(map[models.NodeID]ReplicatorPeer),
-		statistics:    metrics.NewStorageWriteAheadLogStatistics(shard.Database().Name(), shard.ShardID().String()),
-		logger:        logger.GetLogger("Replica", "Partition"),
+	p := &partition{
+		ctx:                  c,
+		cancel:               cancel,
+		log:                  log,
+		db:                   shard.Database().Name(),
+		shardID:              shard.ShardID(),
+		shard:                shard,
+		family:               family,
+		running:              atomic.NewBool(false),
+		closed:               atomic.NewBool(false),
+		currentNodeID:        currentNodeID,
+		cliFct:               cliFct,
+		stateMgr:             stateMgr,
+		replicators:          make(map[models.NodeID]Replicator),
+		statistics:           metrics.NewStorageWriteAheadLogStatistics(shard.Database().Name(), shard.ShardID().String()),
+		replicatorStatistics: make(map[models.NodeID]*metrics.StorageReplicatorRunnerStatistics),
+		logger:               logger.GetLogger("Replica", "Partition"),
 	}
+	return p
 }
 
 // ReplicaLog writes msg that leader sends replica msg.
 // return appended index, if success.
 func (p *partition) ReplicaLog(replicaIdx int64, msg []byte) (int64, error) {
+	if p.closed.Load() {
+		return 0, constants.ErrPartitionClosed
+	}
 	appendIdx := p.log.Queue().AppendedSeq() + 1
 	if replicaIdx != appendIdx {
 		return appendIdx, nil
@@ -189,15 +208,25 @@ func (p *partition) stopReplicator(node string) {
 
 	nodeID := models.ParseNodeID(node)
 	// shutdown replicator if exist
-	peer, ok := p.peers[nodeID]
+	replicator, ok := p.replicators[nodeID]
 	if ok {
-		peer.Shutdown()
-		delete(p.peers, nodeID)
+		replicator.Close()
+		// copy on write
+		replicators := make(map[models.NodeID]Replicator, len(p.replicators)-1)
+		for id := range p.replicators {
+			if id != nodeID {
+				replicators[id] = p.replicators[id]
+			}
+		}
+		p.replicators = replicators
 	}
 }
 
 // WriteLog writes msg that leader sends replica msg.
 func (p *partition) WriteLog(msg []byte) error {
+	if p.closed.Load() {
+		return constants.ErrPartitionClosed
+	}
 	if len(msg) == 0 {
 		return nil
 	}
@@ -249,25 +278,84 @@ func (p *partition) BuildReplicaForFollower(leader, replica models.NodeID) error
 	return err
 }
 
+// StartReplica iterates over all replicators and copies data.
+func (p *partition) StartReplica() {
+	if p.running.CompareAndSwap(false, true) {
+		go p.replicaLoop()
+	}
+}
+
+// replicaLoop starts replica loop
+func (p *partition) replicaLoop() {
+	for p.running.Load() {
+		for nodeID, replicator := range p.replicators {
+			p.replica(nodeID, replicator)
+		}
+	}
+}
+
+// replica tries to consume message
+func (p *partition) replica(nodeID models.NodeID, replicator Replicator) {
+	replicatorStatistics := p.replicatorStatistics[nodeID]
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			replicatorStatistics.ReplicaPanics.Incr()
+			p.logger.Error("panic when replica data",
+				logger.Any("err", recovered),
+				logger.Stack(),
+			)
+		}
+	}()
+
+	if replicator.IsReady() && replicator.Connect() {
+		seq := replicator.Consume()
+		if seq >= 0 {
+			data, err := replicator.GetMessage(seq)
+			if err != nil {
+				replicator.IgnoreMessage(seq)
+				replicatorStatistics.ConsumeMessageFailures.Incr()
+				p.logger.Warn("cannot get replica message data, ignore replica message",
+					logger.String("replicator", replicator.String()),
+					logger.Int64("index", seq), logger.Error(err))
+			} else {
+				replicatorStatistics.ConsumeMessage.Incr()
+				replicator.Replica(seq, data)
+				replicatorStatistics.ReplicaBytes.Add(float64(len(data)))
+			}
+		}
+	} else {
+		p.logger.Warn("replica is not ready", logger.String("replicator", replicator.String()))
+	}
+}
+
 // Close shutdowns all replica workers.
 func (p *partition) Close() error {
-	// close log
-	p.log.Close()
+	if p.closed.CompareAndSwap(false, true) {
+		// close log
+		p.log.Close()
+	}
 	return nil
 }
 
 // Stop stops replicator channel.
 func (p *partition) Stop() {
+	p.running.Store(false)
+	p.stop()
+}
+
+// stop stops replicator channel.
+func (p *partition) stop() {
 	// 1. cancel context of partition(will stop replicator)
 	p.cancel()
 
 	// 2. stop the peer of replicator
 	var waiter sync.WaitGroup
-	waiter.Add(len(p.peers))
-	for k := range p.peers {
-		r := p.peers[k]
+	waiter.Add(len(p.replicators))
+	for k := range p.replicators {
+		r := p.replicators[k]
 		go func() {
-			r.Shutdown()
+			r.Close()
 			waiter.Done()
 		}()
 	}
@@ -291,11 +379,17 @@ func (p *partition) getReplicaState() models.FamilyLogReplicaState {
 			Pending:    fanout.Pending(),
 		}
 		nodeID := models.ParseNodeID(name)
-		if peer, ok := p.getReplicatorRunner(nodeID); ok {
-			replicatorType, replicatorState := peer.ReplicatorState()
+		if replicator, ok := p.replicators[nodeID]; ok {
+			var replicatorType string
+			switch replicator.(type) {
+			case *localReplicator:
+				replicatorType = replicatorTypeLocal
+			case *remoteReplicator:
+				replicatorType = replicatorTypeRemote
+			}
 			peerState.ReplicatorType = replicatorType
-			peerState.State = replicatorState.state
-			peerState.StateErrMsg = replicatorState.errMsg
+			peerState.State = replicator.State().state
+			peerState.StateErrMsg = replicator.State().errMsg
 		}
 
 		stateOfReplicators = append(stateOfReplicators, peerState)
@@ -313,7 +407,7 @@ func (p *partition) buildReplica(leader, replica models.NodeID) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	if _, ok := p.peers[replica]; ok {
+	if _, ok := p.replicators[replica]; ok {
 		// exist
 		return nil
 	}
@@ -321,7 +415,10 @@ func (p *partition) buildReplica(leader, replica models.NodeID) error {
 	if err != nil {
 		return err
 	}
-	var replicator Replicator
+	var (
+		replicator  Replicator
+		replicaType string
+	)
 	channel := ReplicatorChannel{
 		State: &models.ReplicaState{
 			Database:   p.shard.Database().Name(),
@@ -335,25 +432,36 @@ func (p *partition) buildReplica(leader, replica models.NodeID) error {
 	if replica == p.currentNodeID {
 		// local replicator
 		replicator = newLocalReplicatorFn(&channel, p.shard, p.family)
+		replicaType = replicatorTypeLocal
 	} else {
 		// build remote replicator
 		replicator = newRemoteReplicatorFn(p.ctx, &channel, p.stateMgr, p.cliFct)
+		replicaType = replicatorTypeRemote
 	}
 
-	// startup replicator peer
-	peer := newReplicatorPeerFn(replicator)
-	p.peers[replica] = peer
-	peer.Startup()
+	var (
+		state                = replicator.ReplicaState()
+		replicators          = make(map[models.NodeID]Replicator, len(p.replicators))
+		replicatorStatistics = make(map[models.NodeID]*metrics.StorageReplicatorRunnerStatistics, len(p.replicatorStatistics))
+	)
+
+	for nodeID, replicator0 := range p.replicators {
+		replicators[nodeID] = replicator0
+	}
+	for nodeID, statistics := range p.replicatorStatistics {
+		replicatorStatistics[nodeID] = statistics
+	}
+
+	// copy on write
+	replicatorStatistics[replica] = metrics.NewStorageReplicatorRunnerStatistics(replicaType, state.Database, state.ShardID.String())
+	//	the order is to first use replicators and then replicatorStatistics,
+	//	so replicatorStatistics must be assigned first in concurrent scenarios,
+	//	perhaps in the future, this should be refactored to encapsulate two variables into a single structure.
+	p.replicatorStatistics = replicatorStatistics
+	replicators[replica] = replicator
+	p.replicators = replicators
 
 	return nil
-}
-
-func (p *partition) getReplicatorRunner(nodeID models.NodeID) (ReplicatorPeer, bool) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	peer, ok := p.peers[nodeID]
-	return peer, ok
 }
 
 // recovery rebuilds replication relation based on local partition.

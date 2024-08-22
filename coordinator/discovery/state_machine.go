@@ -22,11 +22,11 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/lindb/common/pkg/encoding"
+	"github.com/lindb/common/pkg/logger"
 	"go.uber.org/atomic"
 
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/encoding"
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/pkg/state"
 )
 
@@ -34,6 +34,7 @@ import (
 
 // NewStateMachineFn represents new state machine function.
 var NewStateMachineFn = NewStateMachine
+
 var log = logger.GetLogger("Discovery", "StateMachine")
 
 // StateMachineType represents state machine type.
@@ -111,18 +112,14 @@ type StateMachine interface {
 
 // stateMachine implements StateMachine interface.
 type stateMachine struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	stateMachineType StateMachineType
+	ctx              context.Context
 	discovery        Discovery
-
-	onCreateFn func(key string, resource []byte)
-	onDeleteFn func(key string)
-
-	running *atomic.Bool
-
-	logger *logger.Logger
+	logger           logger.Logger
+	cancel           context.CancelFunc
+	onCreateFn       func(key string, resource []byte)
+	onDeleteFn       func(key string)
+	running          *atomic.Bool
+	stateMachineType StateMachineType
 }
 
 // NewStateMachine creates a state machine instance.
@@ -189,7 +186,7 @@ func (sm *stateMachine) OnDelete(key string) {
 
 // Close closes state machine, stops watch change event.
 func (sm *stateMachine) Close() error {
-	if sm.running.CAS(true, false) {
+	if sm.running.CompareAndSwap(true, false) {
 		defer func() {
 			sm.cancel()
 		}()

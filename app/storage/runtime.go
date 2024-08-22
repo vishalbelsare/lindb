@@ -27,6 +27,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/lindb/common/pkg/fileutil"
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/timeutil"
+
 	"github.com/lindb/lindb/app"
 	stateapi "github.com/lindb/lindb/app/storage/api/state"
 	rpchandler "github.com/lindb/lindb/app/storage/rpc"
@@ -35,20 +39,15 @@ import (
 	"github.com/lindb/lindb/coordinator/discovery"
 	"github.com/lindb/lindb/coordinator/storage"
 	"github.com/lindb/lindb/internal/api"
-	"github.com/lindb/lindb/internal/bootstrap"
 	"github.com/lindb/lindb/internal/concurrent"
 	"github.com/lindb/lindb/internal/linmetric"
 	"github.com/lindb/lindb/internal/server"
 	"github.com/lindb/lindb/kv"
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/encoding"
-	"github.com/lindb/lindb/pkg/fileutil"
 	"github.com/lindb/lindb/pkg/hostutil"
 	httppkg "github.com/lindb/lindb/pkg/http"
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/pkg/state"
-	"github.com/lindb/lindb/pkg/timeutil"
 	protoCommonV1 "github.com/lindb/lindb/proto/gen/v1/common"
 	protoReplicaV1 "github.com/lindb/lindb/proto/gen/v1/replica"
 	protoWriteV1 "github.com/lindb/lindb/proto/gen/v1/write"
@@ -71,10 +70,16 @@ type rpcHandler struct {
 	task    *query.TaskHandler
 }
 
+var (
+	maxRetries    = 20
+	retryInterval = time.Second
+)
+
 // just for testing
 var (
 	getHostIP                 = hostutil.GetHostIP
 	hostName                  = os.Hostname
+	newRegistry               = discovery.NewRegistry
 	newStateMachineFactory    = storage.NewStateMachineFactory
 	newDatabaseLifecycleFn    = NewDatabaseLifecycle
 	newEngineFn               = tsdb.NewEngine
@@ -89,37 +94,30 @@ var (
 
 // runtime represents storage runtime dependency
 type runtime struct {
-	app.BaseRuntime
-	myID    int // default myid value
-	state   server.State
-	version string
-	config  *config.Storage
-
-	delayInit   time.Duration
-	initializer bootstrap.ClusterInitializer
-
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	jobScheduler kv.JobScheduler
-
+	factory             factory
 	stateMachineFactory discovery.StateMachineFactory
+	queryPool           concurrent.Pool
+	httpServer          httppkg.Server
+	engine              tsdb.Engine
+	ctx                 context.Context
+	log                 logger.Logger
+	jobScheduler        kv.JobScheduler
+	repoFactory         state.RepositoryFactory
 	stateMgr            storage.StateManager
 	walMgr              replica.WriteAheadLogManager
 	dbLifecycle         DatabaseLifecycle
-
-	node            *models.StatefulNode
-	server          rpc.GRPCServer
-	repoFactory     state.RepositoryFactory
-	repo            state.Repository
-	factory         factory
-	engine          tsdb.Engine
-	rpcHandler      *rpcHandler
-	httpServer      httppkg.Server
-	queryPool       concurrent.Pool
+	repo                state.Repository
+	server              rpc.GRPCServer
+	registry            discovery.Registry
+	cancel              context.CancelFunc
+	node                *models.StatefulNode
+	config              *config.Storage
+	rpcHandler          *rpcHandler
+	version             string
+	app.BaseRuntime
 	globalKeyValues tag.Tags
-
-	log *logger.Logger
+	state           server.State
+	myID            int
 }
 
 // NewStorageRuntime creates storage runtime
@@ -138,9 +136,7 @@ func NewStorageRuntime(version string, myID int, cfg *config.Storage) server.Ser
 			cfg.Query.QueryConcurrency,
 			cfg.Query.IdleTimeout.Duration(),
 			metrics.NewConcurrentStatistics("storage-query", linmetric.StorageRegistry)),
-		delayInit:   time.Second,
-		initializer: bootstrap.NewClusterInitializer(cfg.StorageBase.BrokerEndpoint),
-		log:         logger.GetLogger("Storage", "Runtime"),
+		log: logger.GetLogger("Storage", "Runtime"),
 	}
 }
 
@@ -172,11 +168,7 @@ func (r *runtime) Run() error {
 		return fmt.Errorf("failed to get server ip address, error: %s", err)
 	}
 
-	opt := kv.StoreOptions{
-		Dir: config.GlobalStorageConfig().TSDB.Dir,
-	}
-	kv.Options.Store(&opt)
-	r.jobScheduler = kv.NewJobScheduler(r.ctx, opt)
+	r.jobScheduler = kv.NewJobScheduler(r.ctx, kv.DefaultCompactCheckInterval)
 	r.jobScheduler.Startup() // startup kv compact job scheduler
 
 	// start TSDB engine for storage server
@@ -210,9 +202,6 @@ func (r *runtime) Run() error {
 	}
 	r.BaseRuntime = app.NewBaseRuntimeFn(r.ctx, r.config.Monitor, linmetric.StorageRegistry, r.globalKeyValues)
 
-	r.factory = factory{taskServer: rpc.NewTaskServerFactory()}
-	r.stateMgr = storage.NewStateManager(r.ctx, r.node, engine)
-
 	walMgr := newWriteAheadLogManagerFn(
 		r.ctx,
 		r.config.StorageBase.WAL,
@@ -226,11 +215,6 @@ func (r *runtime) Run() error {
 	}
 	r.walMgr = walMgr
 
-	// start tcp server
-	r.startTCPServer()
-	// start http server
-	r.startHTTPServer()
-
 	// start state repo
 	if err := r.startStateRepo(); err != nil {
 		r.log.Error("start state repo failure", logger.Error(err))
@@ -238,93 +222,80 @@ func (r *runtime) Run() error {
 		return err
 	}
 
+	r.factory = factory{taskServer: rpc.NewTaskServerFactory()}
+	r.stateMgr = storage.NewStateManager(r.ctx, r.repo, r.node, engine)
+
+	// start tcp server
+	r.startTCPServer()
+	// start http server
+	r.startHTTPServer()
+
+	discoveryFactory := discovery.NewFactory(r.repo)
+	r.stateMachineFactory = newStateMachineFactory(r.ctx, discoveryFactory, r.stateMgr)
 	r.dbLifecycle = newDatabaseLifecycleFn(r.ctx, r.repo, r.walMgr, r.engine)
 	r.dbLifecycle.Startup()
 
-	// Use Leader election mechanism to ensure the uniqueness of stateful node id
-	if err := r.MustRegisterStateFulNode(); err != nil {
+	if err := r.startStorageState(); err != nil {
+		r.state = server.Failed
 		return err
 	}
-	discoveryFactory := discovery.NewFactory(r.repo)
-	// finally, start all state machine
-	r.stateMachineFactory = newStateMachineFactory(r.ctx, discoveryFactory, r.stateMgr)
-
-	if err := r.stateMachineFactory.Start(); err != nil {
-		return fmt.Errorf("start state machines error: %s", err)
-	}
-
 	// start system collector
 	r.SystemCollector()
 	// start stat monitoring
 	r.NativePusher()
 
 	r.state = server.Running
-
-	time.AfterFunc(r.delayInit, func() {
-		r.log.Info("starting register storage cluster in broker")
-		if err := r.initializer.InitStorageCluster(config.StorageCluster{Config: &r.config.Coordinator}); err != nil {
-			r.log.Error("register storage cluster with error", logger.Error(err))
-		} else {
-			r.log.Info("register storage cluster successfully")
-		}
-	})
 	return nil
 }
 
-// MustRegisterStateFulNode make sure that state node is registered to etcd
-func (r *runtime) MustRegisterStateFulNode() error {
+func (r *runtime) startStorageState() error {
+	// Use Leader election mechanism to ensure the uniqueness of stateful node id
+	if err := r.MustRegisterStatefulNode(); err != nil {
+		return err
+	}
+	// finally, start all state machine
+	if err := r.stateMachineFactory.Start(); err != nil {
+		return fmt.Errorf("start state machines error: %s", err)
+	}
+	return nil
+}
+
+// MustRegisterStatefulNode make sure that state node is registered to etcd
+func (r *runtime) MustRegisterStatefulNode() error {
 	r.log.Info("registering stateful storage node...",
 		logger.Int("indicator", int(r.node.ID)),
 		logger.String("lease-ttl", r.config.Coordinator.LeaseTTL.String()),
 	)
-	var (
-		ok            bool
-		err           error
-		maxRetries    = 20
-		retryInterval = time.Second
-	)
+	var err error
 	// sometimes lease isn't expired when storage restarts, retry registering is necessary
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		select {
 		case <-r.ctx.Done(): // no more retries when context is done
-			return nil
+			return r.ctx.Err()
 		default:
 		}
-		ok, _, err = r.repo.Elect(
-			r.ctx,
-			constants.GetLiveNodePath(strconv.Itoa(int(r.node.ID))),
-			encoding.JSONMarshal(r.node),
-			int64(r.config.Coordinator.LeaseTTL.Duration().Seconds()))
-		if ok {
-			r.log.Info("registered state node successfully",
-				logger.Int("indicator", int(r.node.ID)),
-				logger.String("lease-ttl", r.config.Coordinator.LeaseTTL.String()),
-			)
-			return nil
-		}
+		// register storage node info
+		r.registry = newRegistry(r.repo, constants.GetStorageLiveNodePath(strconv.Itoa(int(r.node.ID))),
+			r.node, r.config.Coordinator.LeaseTTL.Duration())
+		err = r.registry.Register()
 		if err != nil {
 			r.log.Error("failed to register state node",
 				logger.Int("indicator", int(r.node.ID)),
 				logger.Int("attempt", attempt),
 				logger.Error(err),
 			)
+			time.Sleep(retryInterval)
+			continue
 		}
-		if !ok {
-			r.log.Error("stateful node is already registered",
-				logger.Int("indicator", int(r.node.ID)),
-				logger.Int("attempt", attempt),
-			)
-		}
-		time.Sleep(retryInterval)
+		r.log.Info("registered state node successfully",
+			logger.Int("indicator", int(r.node.ID)),
+			logger.String("lease-ttl", r.config.Coordinator.LeaseTTL.String()),
+		)
+		return nil
 	}
 	r.state = server.Failed
-	if err != nil {
-		// stateful node register err
-		return err
-	}
-	// stateful node already exist
-	r.state = server.Failed
-	return constants.ErrStatefulNodeExist
+	// stateful node register err
+	return err
 }
 
 // State returns current storage server state
@@ -334,7 +305,7 @@ func (r *runtime) State() server.State {
 
 // startStateRepo starts state repository
 func (r *runtime) startStateRepo() error {
-	repo, err := r.repoFactory.CreateStorageRepo(&r.config.Coordinator)
+	repo, err := r.repoFactory.CreateNormalRepo(&r.config.Coordinator)
 	if err != nil {
 		return fmt.Errorf("start storage state repository error:%s", err)
 	}
@@ -354,10 +325,23 @@ func (r *runtime) Stop() {
 		r.jobScheduler.Shutdown()
 	}
 
+	// close registry, deregister broker node from active list
+	if r.registry != nil {
+		r.log.Info("closing discovery-registry...")
+		if err := r.registry.Deregister(); err != nil {
+			r.log.Error("unregister storage node error", logger.Error(err))
+		}
+		if err := r.registry.Close(); err != nil {
+			r.log.Error("unregister storage node error", logger.Error(err))
+		} else {
+			r.log.Info("closed discovery-registry successfully")
+		}
+	}
+
 	// close state repo if exist
 	if r.repo != nil {
 		r.log.Info("closing state repo...")
-		if err := r.repo.Delete(r.ctx, constants.GetLiveNodePath(strconv.Itoa(int(r.node.ID)))); err != nil {
+		if err := r.repo.Delete(r.ctx, constants.GetStorageLiveNodePath(strconv.Itoa(int(r.node.ID)))); err != nil {
 			r.log.Warn("delete storage node register info")
 		}
 		if err := r.repo.Close(); err != nil {
@@ -421,12 +405,14 @@ func (r *runtime) startHTTPServer() {
 	metadataAPI := stateapi.NewMetadataAPI(r.engine)
 	metadataAPI.Register(v1)
 
-	go func() {
-		if err := r.httpServer.Run(); err != http.ErrServerClosed {
-			panic(fmt.Sprintf("start http server with error: %s", err))
-		}
-		r.log.Info("http server stopped successfully")
-	}()
+	go r.runHTTPServer()
+}
+
+func (r *runtime) runHTTPServer() {
+	if err := r.httpServer.Run(); err != http.ErrServerClosed {
+		panic(fmt.Sprintf("start http server with error: %s", err))
+	}
+	r.log.Info("http server stopped successfully")
 }
 
 // startTCPServer starts tcp server
@@ -436,16 +422,18 @@ func (r *runtime) startTCPServer() {
 	// bind rpc handlers
 	r.bindRPCHandlers()
 
-	go func() {
-		if err := r.server.Start(); err != nil {
-			panic(err)
-		}
-	}()
+	go r.startRPCServer()
+}
+
+func (r *runtime) startRPCServer() {
+	if err := r.server.Start(); err != nil {
+		panic(err)
+	}
 }
 
 // bindRPCHandlers binds rpc handlers, registers task into grpc server
 func (r *runtime) bindRPCHandlers() {
-	//FIXME: (stone1100) need close
+	// FIXME: (stone1100) need close
 	leafTaskProcessor := query.NewLeafTaskProcessor(
 		r.node,
 		r.engine,

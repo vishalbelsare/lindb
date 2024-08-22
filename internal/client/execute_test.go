@@ -24,20 +24,20 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lindb/common/pkg/encoding"
+	"github.com/lindb/common/pkg/timeutil"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/encoding"
-	"github.com/lindb/lindb/pkg/timeutil"
 )
 
 func TestExecuteCli_Execute(t *testing.T) {
 	cases := []struct {
-		name    string
-		param   models.ExecuteParam
-		url     string
 		rs      interface{}
 		prepare func(rw http.ResponseWriter)
+		param   models.ExecuteParam
+		name    string
+		url     string
 		wantErr bool
 	}{
 		{
@@ -71,7 +71,7 @@ func TestExecuteCli_Execute(t *testing.T) {
 	for _, tt := range cases {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 				if tt.prepare != nil {
 					tt.prepare(rw)
 				}
@@ -79,7 +79,7 @@ func TestExecuteCli_Execute(t *testing.T) {
 			defer server.Close()
 
 			cli := NewExecuteCli(server.URL)
-			if len(tt.url) > 0 {
+			if tt.url != "" {
 				cli = NewExecuteCli(tt.url)
 			}
 			err := cli.Execute(tt.param, &tt.rs)
@@ -157,7 +157,7 @@ func TestExecuteCli_ExecuteAsResult(t *testing.T) {
 	for _, tt := range cases {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 				if tt.prepare != nil {
 					tt.prepare(rw)
 				}

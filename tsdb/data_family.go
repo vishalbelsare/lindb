@@ -24,17 +24,17 @@ import (
 	"sync"
 	"time"
 
-	"go.uber.org/atomic"
-
 	"github.com/lindb/common/pkg/fasttime"
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/ltoml"
+	commontimeutil "github.com/lindb/common/pkg/timeutil"
+	"go.uber.org/atomic"
 
 	"github.com/lindb/lindb/config"
 	"github.com/lindb/lindb/flow"
 	"github.com/lindb/lindb/kv"
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/logger"
-	"github.com/lindb/lindb/pkg/ltoml"
 	"github.com/lindb/lindb/pkg/timeutil"
 	"github.com/lindb/lindb/series/metric"
 	"github.com/lindb/lindb/tsdb/memdb"
@@ -58,7 +58,7 @@ type DataFamily interface {
 	// Family returns the raw kv family
 	Family() kv.Family
 	// WriteRows writes metric rows with same family in batch.
-	WriteRows(rows []metric.StorageRow) error
+	WriteRows(rows []*metric.StorageRow) error
 	// ValidateSequence validates replica sequence if valid.
 	ValidateSequence(leader int32, seq int64) bool
 	// CommitSequence commits written sequence after write data.
@@ -94,35 +94,28 @@ type DataFamily interface {
 
 // dataFamily represents a wrapper of kv store's family with basic info
 type dataFamily struct {
-	indicator     string // database + shard + family time
-	shard         Shard
-	segment       Segment
-	interval      timeutil.Interval
-	intervalCalc  timeutil.IntervalCalculator
-	familyTime    int64
-	timeRange     timeutil.TimeRange
-	family        kv.Family
-	lastFlushTime int64
-
-	mutableMemDB   memdb.MemoryDatabase
+	family         kv.Family
+	shard          Shard
+	segment        Segment
+	logger         logger.Logger
+	intervalCalc   timeutil.IntervalCalculator
 	immutableMemDB memdb.MemoryDatabase
-
-	// leader => seq
-	seq          map[int32]atomic.Int64
-	immutableSeq map[int32]int64
-	persistSeq   map[int32]atomic.Int64
-
-	callbacks map[int32][]func(seq int64) // leader => callback
-
-	isFlushing     atomic.Bool    // restrict flusher concurrency
-	flushCondition sync.WaitGroup // flush condition
-
-	ref          atomic.Int32 // ref count for writing
-	lastReadTime *atomic.Int64
-	mutex        sync.Mutex
-
-	statistics *metrics.FamilyStatistics
-	logger     *logger.Logger
+	mutableMemDB   memdb.MemoryDatabase
+	statistics     *metrics.FamilyStatistics
+	seq            map[int32]atomic.Int64
+	immutableSeq   map[int32]int64
+	persistSeq     map[int32]atomic.Int64
+	callbacks      map[int32][]func(seq int64)
+	lastReadTime   *atomic.Int64
+	indicator      string
+	flushCondition sync.WaitGroup
+	timeRange      timeutil.TimeRange
+	familyTime     int64
+	ref            atomic.Int32
+	isFlushing     atomic.Bool
+	lastFlushTime  int64
+	interval       timeutil.Interval
+	mutex          sync.Mutex
 }
 
 // newDataFamily creates a data family storage unit
@@ -144,7 +137,7 @@ func newDataFamily(
 		timeRange:     timeRange,
 		familyTime:    familyTime,
 		family:        family,
-		lastFlushTime: timeutil.Now(),
+		lastFlushTime: commontimeutil.Now(),
 		seq:           make(map[int32]atomic.Int64),
 		persistSeq:    make(map[int32]atomic.Int64),
 		callbacks:     make(map[int32][]func(seq int64)),
@@ -165,7 +158,7 @@ func newDataFamily(
 	}
 
 	f.indicator = fmt.Sprintf("%s/%s/%s", dbName, shardIDStr,
-		timeutil.FormatTimestamp(familyTime, timeutil.DataTimeFormat4))
+		commontimeutil.FormatTimestamp(familyTime, commontimeutil.DataTimeFormat4))
 
 	// add data family into global family manager
 	GetFamilyManager().AddFamily(f)
@@ -216,7 +209,7 @@ func (f *dataFamily) NeedFlush() bool {
 		// check immutable memory database, make sure it is nil
 		return false
 	}
-	if f.mutableMemDB == nil || f.mutableMemDB.NumOfMetrics() <= 0 {
+	if f.mutableMemDB == nil || f.mutableMemDB.NumOfSeries() <= 0 {
 		// no data
 		return false
 	}
@@ -231,21 +224,25 @@ func (f *dataFamily) NeedFlush() bool {
 		}
 	}
 	maxMemDBSize := config.GlobalStorageConfig().TSDB.MaxMemDBSize
+	memDBUptime := f.mutableMemDB.Uptime()
+	memDBHeapSize := f.mutableMemDB.MemSize()
 
 	f.logger.Info("check memory database if need flush",
 		logger.String("family", f.indicator),
-		logger.String("uptime", f.mutableMemDB.Uptime().String()),
+		logger.Any("check-ttl", memDBUptime >= ttl),
+		logger.Any("check-memdb-heap-size", memDBHeapSize >= int64(maxMemDBSize)),
+		logger.String("uptime", memDBUptime.String()),
 		logger.String("mutable-memdb-ttl", ttl.String()),
-		logger.String("memdb-size", ltoml.Size(f.mutableMemDB.MemSize()).String()),
+		logger.String("memdb-size", ltoml.Size(memDBHeapSize).String()),
 		logger.String("max-memdb-size", maxMemDBSize.String()),
 	)
 
 	// check memory database's uptime
-	if f.mutableMemDB.Uptime() >= ttl {
+	if memDBUptime >= ttl {
 		return true
 	}
 	// check memory database's heap size
-	if f.mutableMemDB.MemSize() >= int64(maxMemDBSize) {
+	if memDBHeapSize >= int64(maxMemDBSize) {
 		return true
 	}
 	return false
@@ -258,7 +255,7 @@ func (f *dataFamily) IsFlushing() bool {
 
 // Flush flushes memory database.
 func (f *dataFamily) Flush() error {
-	if f.isFlushing.CAS(false, true) {
+	if f.isFlushing.CompareAndSwap(false, true) {
 		defer func() {
 			// mark flush job complete, notify
 			f.flushCondition.Done()
@@ -272,7 +269,7 @@ func (f *dataFamily) Flush() error {
 
 		// add lock when switch memory database
 		f.mutex.Lock()
-		if f.immutableMemDB != nil || f.mutableMemDB == nil || f.mutableMemDB.NumOfMetrics() == 0 {
+		if f.immutableMemDB != nil || f.mutableMemDB == nil || f.mutableMemDB.NumOfSeries() == 0 {
 			// if immutable memory database not nil or no data need flush, return it
 			f.mutex.Unlock()
 			return nil
@@ -325,7 +322,7 @@ func (f *dataFamily) Compact() {
 		return
 	}
 
-	diff := fasttime.UnixMilliseconds() - f.lastFlushTime - 2*timeutil.OneHour
+	diff := fasttime.UnixMilliseconds() - f.lastFlushTime - 2*commontimeutil.OneHour
 	if diff >= 0 {
 		// long term no data write, does full compact
 		f.family.Compact()
@@ -357,17 +354,17 @@ func (f *dataFamily) Evict() {
 	}
 	f.mutex.Unlock()
 
-	now := timeutil.Now()
+	now := commontimeutil.Now()
 	ahead, _ := f.shard.Database().GetOption().GetAcceptWritableRange()
-	diff := now - f.familyTime - 6*timeutil.OneHour
+	diff := now - f.familyTime - 6*commontimeutil.OneHour
 	f.logger.Info("check family if expire",
-		logger.String("baseTime", timeutil.FormatTimestamp(f.familyTime, timeutil.DataTimeFormat2)),
-		logger.String("lastRead", timeutil.FormatTimestamp(f.lastReadTime.Load(), timeutil.DataTimeFormat2)),
+		logger.String("baseTime", commontimeutil.FormatTimestamp(f.familyTime, commontimeutil.DataTimeFormat2)),
+		logger.String("lastRead", commontimeutil.FormatTimestamp(f.lastReadTime.Load(), commontimeutil.DataTimeFormat2)),
 		logger.Any("ahead", time.Duration(ahead).String()), logger.String("diff", time.Duration(diff).String()))
 	if diff <= ahead {
 		return
 	}
-	diff = now - f.lastReadTime.Load() - 2*timeutil.OneHour
+	diff = now - f.lastReadTime.Load() - 2*commontimeutil.OneHour
 	if diff > ahead {
 		if err := closeFamilyFunc(f); err != nil {
 			f.logger.Error("close family err when evict", logger.String("family", f.Indicator()))
@@ -428,11 +425,10 @@ func (f *dataFamily) GetState() models.DataFamilyState {
 
 	memoryDBState := func(state string, memoryDatabase memdb.MemoryDatabase) {
 		memoryDatabaseState = append(memoryDatabaseState, models.MemoryDatabaseState{
-			State:        state,
-			Uptime:       memoryDatabase.Uptime(),
-			MemSize:      memoryDatabase.MemSize(),
-			NumOfMetrics: memoryDatabase.NumOfMetrics(),
-			NumOfSeries:  memoryDatabase.NumOfSeries(),
+			State:       state,
+			Uptime:      memoryDatabase.Uptime(),
+			MemSize:     memoryDatabase.MemSize(),
+			NumOfSeries: memoryDatabase.NumOfSeries(),
 		})
 	}
 
@@ -446,7 +442,7 @@ func (f *dataFamily) GetState() models.DataFamilyState {
 
 	state := models.DataFamilyState{
 		ShardID:          f.shard.ShardID(),
-		FamilyTime:       timeutil.FormatTimestamp(f.familyTime, timeutil.DataTimeFormat2),
+		FamilyTime:       commontimeutil.FormatTimestamp(f.familyTime, commontimeutil.DataTimeFormat2),
 		AckSequences:     ackSequences,
 		ReplicaSequences: replicaSequences,
 		MemoryDatabases:  memoryDatabaseState,
@@ -491,7 +487,7 @@ func (f *dataFamily) fileFilter(shardExecuteContext *flow.ShardExecuteContext) (
 	readers, err := snapShot.FindReaders(metricKey)
 	if err != nil {
 		engineLogger.Error("filter data family error", logger.Error(err))
-		return
+		return nil, err
 	}
 	querySlotRange := shardExecuteContext.StorageExecuteCtx.CalcSourceSlotRange(f.familyTime)
 	var metricReaders []metricsdata.MetricReader
@@ -511,14 +507,14 @@ func (f *dataFamily) fileFilter(shardExecuteContext *flow.ShardExecuteContext) (
 		}
 	}
 	if len(metricReaders) == 0 {
-		return
+		return nil, nil
 	}
 	filter := newFilterFunc(f.timeRange.Start, snapShot, metricReaders)
 	return filter.Filter(shardExecuteContext.SeriesIDsAfterFiltering, shardExecuteContext.StorageExecuteCtx.Fields)
 }
 
 // WriteRows writes metric rows with same family in batch.
-func (f *dataFamily) WriteRows(rows []metric.StorageRow) error {
+func (f *dataFamily) WriteRows(rows []*metric.StorageRow) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -530,34 +526,25 @@ func (f *dataFamily) WriteRows(rows []metric.StorageRow) error {
 		return err
 	}
 	db.AcquireWrite()
-	releaseFunc := db.WithLock()
-	memSizeBefore := db.MemSize()
 	defer func() {
 		f.statistics.WriteBatches.Incr()
-		f.statistics.MemDBTotalSize.Add(float64(db.MemSize() - memSizeBefore))
 		db.CompleteWrite()
-		releaseFunc()
 	}()
 
 	for idx := range rows {
 		row := rows[idx]
-		if !row.Writable {
-			f.statistics.WriteMetricFailures.Incr()
-			continue
-		}
-		row.SlotIndex = uint16(f.intervalCalc.CalcSlot(
-			row.Timestamp(),
-			f.familyTime,
-			f.interval.Int64()),
-		)
-		err := db.WriteRow(&row)
+		err := db.WriteRow(row)
 		if err == nil {
 			f.statistics.WriteMetrics.Incr()
-			f.statistics.WriteFields.Add(float64(len(row.FieldIDs)))
+			f.statistics.WriteFields.Add(row.WrittenFields)
 		} else {
 			f.statistics.WriteMetricFailures.Incr()
 			f.logger.Error("failed writing row", logger.String("family", f.indicator), logger.Error(err))
 		}
+
+		// waiting all operators done(write data/build meta and index)
+		// TODO: add timeout??
+		row.Wait()
 	}
 
 	return nil
@@ -607,10 +594,13 @@ func (f *dataFamily) GetOrCreateMemoryDatabase(familyTime int64) (memdb.MemoryDa
 	defer f.mutex.Unlock()
 
 	if f.mutableMemDB == nil {
-		newDB, err := newMemoryDBFunc(memdb.MemoryDatabaseCfg{
-			FamilyTime: familyTime,
-			Name:       f.shard.Database().Name(),
-			BufferMgr:  f.shard.BufferManager(),
+		newDB, err := newMemoryDBFunc(&memdb.MemoryDatabaseCfg{
+			FamilyTime:    familyTime,
+			IntervalCalc:  f.intervalCalc,
+			Interval:      f.interval,
+			Name:          f.shard.Database().Name(),
+			IndexDatabase: f.shard.MemIndexDB(),
+			BufferMgr:     f.shard.BufferManager(),
 		})
 		if err != nil {
 			return nil, err
@@ -689,7 +679,6 @@ func (f *dataFamily) flushMemoryDatabase(sequences map[int32]int64, memDB memdb.
 	}
 
 	f.statistics.ActiveMemDBs.Decr()
-	f.statistics.MemDBTotalSize.Sub(float64(memDB.MemSize()))
 
 	if err := memDB.Close(); err != nil {
 		// ignore close memory database err, if not maybe write duplicate data into file storage
@@ -698,5 +687,6 @@ func (f *dataFamily) flushMemoryDatabase(sequences map[int32]int64, memDB memdb.
 			logger.Int64("memDBSize", memDB.MemSize()))
 		return nil
 	}
+
 	return nil
 }

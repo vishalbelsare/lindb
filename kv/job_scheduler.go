@@ -21,9 +21,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/lindb/common/pkg/logger"
 	"go.uber.org/atomic"
-
-	"github.com/lindb/lindb/pkg/logger"
 )
 
 // JobScheduler represents a background compaction job scheduler.
@@ -38,37 +37,35 @@ type JobScheduler interface {
 
 // jobScheduler implements JobScheduler interface.
 type jobScheduler struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	option  StoreOptions
-	running *atomic.Bool
-
-	logger *logger.Logger
+	ctx      context.Context
+	logger   logger.Logger
+	cancel   context.CancelFunc
+	running  *atomic.Bool
+	interval time.Duration
 }
 
 // NewJobScheduler creates a JobScheduler instance.
-func NewJobScheduler(ctx context.Context, option StoreOptions) JobScheduler {
+func NewJobScheduler(ctx context.Context, interval time.Duration) JobScheduler {
 	ctx, cancel := context.WithCancel(ctx)
 	return &jobScheduler{
-		option:  option,
-		ctx:     ctx,
-		cancel:  cancel,
-		running: atomic.NewBool(false),
-		logger:  logger.GetLogger("KV", "JobScheduler"),
+		interval: interval,
+		ctx:      ctx,
+		cancel:   cancel,
+		running:  atomic.NewBool(false),
+		logger:   logger.GetLogger("KV", "JobScheduler"),
 	}
 }
 
 // Startup starts the job scheduler.
 func (js *jobScheduler) Startup() {
-	if js.running.CAS(false, true) {
+	if js.running.CompareAndSwap(false, true) {
 		js.schedule()
 	}
 }
 
 // Shutdown stops the job scheduler.
 func (js *jobScheduler) Shutdown() {
-	if js.running.CAS(true, false) {
+	if js.running.CompareAndSwap(true, false) {
 		js.cancel()
 	}
 }
@@ -82,11 +79,7 @@ func (js *jobScheduler) IsRunning() bool {
 // 1. check if it needs to do compact or rollup.
 // 2. if it needs, start new goroutine does compact or rollup job.
 func (js *jobScheduler) schedule() {
-	interval := defaultCompactCheckInterval
-	if js.option.CompactCheckInterval > 0 {
-		interval = js.option.CompactCheckInterval
-	}
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	ticker := time.NewTicker(js.interval)
 	go func() {
 		for {
 			select {

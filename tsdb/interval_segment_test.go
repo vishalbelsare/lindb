@@ -21,12 +21,13 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	"github.com/lindb/common/pkg/fileutil"
+	"github.com/lindb/common/pkg/logger"
+	commontimeutil "github.com/lindb/common/pkg/timeutil"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/fileutil"
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/pkg/option"
 	"github.com/lindb/lindb/pkg/timeutil"
 )
@@ -42,8 +43,8 @@ func TestIntervalSegment_New(t *testing.T) {
 	shard.EXPECT().ShardID().Return(models.ShardID(1)).AnyTimes()
 
 	cases := []struct {
-		name    string
 		prepare func()
+		name    string
 		wantErr bool
 	}{
 		{
@@ -77,7 +78,7 @@ func TestIntervalSegment_New(t *testing.T) {
 			if tt.prepare != nil {
 				tt.prepare()
 			}
-			s, err := newIntervalSegment(shard, option.Interval{Interval: timeutil.Interval(timeutil.OneSecond * 10)})
+			s, err := newIntervalSegment(shard, option.Interval{Interval: timeutil.Interval(commontimeutil.OneSecond * 10)})
 			if ((err != nil) != tt.wantErr && s == nil) || (!tt.wantErr && s == nil) {
 				t.Errorf("newIntervalSegment() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -93,9 +94,9 @@ func TestIntervalSegment_GetOrCreateSegment(t *testing.T) {
 	segment := NewMockSegment(ctrl)
 
 	cases := []struct {
+		prepare     func()
 		name        string
 		segmentName string
-		prepare     func()
 		wantErr     bool
 	}{
 		{
@@ -132,7 +133,7 @@ func TestIntervalSegment_GetOrCreateSegment(t *testing.T) {
 				newSegmentFunc = newSegment
 			}()
 			s := &intervalSegment{
-				interval: option.Interval{Interval: timeutil.Interval(timeutil.OneSecond * 10)},
+				interval: option.Interval{Interval: timeutil.Interval(commontimeutil.OneSecond * 10)},
 				segments: map[string]Segment{
 					"test": segment,
 				},
@@ -154,7 +155,7 @@ func TestIntervalSegment_Close(t *testing.T) {
 
 	segment := NewMockSegment(ctrl)
 	s := &intervalSegment{
-		interval: option.Interval{Interval: timeutil.Interval(timeutil.OneSecond * 10)},
+		interval: option.Interval{Interval: timeutil.Interval(commontimeutil.OneSecond * 10)},
 		segments: map[string]Segment{
 			"test": segment,
 		},
@@ -167,14 +168,14 @@ func TestIntervalSegment_GetDataFamilies(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	now := timeutil.Now() - 4*timeutil.OneDay
-	segmentDir := timeutil.FormatTimestamp(now, "20060102")
+	now := commontimeutil.Now() - 4*commontimeutil.OneDay
+	segmentDir := commontimeutil.FormatTimestamp(now, "20060102")
 	segment := NewMockSegment(ctrl)
 
 	cases := []struct {
+		prepare   func(s *intervalSegment)
 		name      string
 		timeRange timeutil.TimeRange
-		prepare   func(s *intervalSegment)
 		len       int
 	}{
 		{
@@ -199,8 +200,8 @@ func TestIntervalSegment_GetDataFamilies(t *testing.T) {
 			name: "segment is expired",
 			prepare: func(s *intervalSegment) {
 				s.interval = option.Interval{
-					Interval:  timeutil.Interval(timeutil.OneSecond * 10),
-					Retention: timeutil.Interval(timeutil.OneDay * 2),
+					Interval:  timeutil.Interval(commontimeutil.OneSecond * 10),
+					Retention: timeutil.Interval(commontimeutil.OneDay * 2),
 				}
 				listDir = func(path string) ([]string, error) {
 					return []string{segmentDir}, nil
@@ -211,8 +212,8 @@ func TestIntervalSegment_GetDataFamilies(t *testing.T) {
 		{
 			name: "time range not match",
 			timeRange: timeutil.TimeRange{
-				Start: timeutil.Now() - 4*timeutil.OneHour,
-				End:   timeutil.Now(),
+				Start: commontimeutil.Now() - 4*commontimeutil.OneHour,
+				End:   commontimeutil.Now(),
 			},
 			prepare: func(s *intervalSegment) {
 				listDir = func(path string) ([]string, error) {
@@ -224,7 +225,7 @@ func TestIntervalSegment_GetDataFamilies(t *testing.T) {
 		{
 			name: "get segment from memory",
 			timeRange: timeutil.TimeRange{
-				Start: now - 4*timeutil.OneHour,
+				Start: now - 4*commontimeutil.OneHour,
 				End:   now,
 			},
 			prepare: func(s *intervalSegment) {
@@ -238,7 +239,7 @@ func TestIntervalSegment_GetDataFamilies(t *testing.T) {
 		{
 			name: "load segment failure",
 			timeRange: timeutil.TimeRange{
-				Start: now - 2*timeutil.OneHour,
+				Start: now - 2*commontimeutil.OneHour,
 				End:   now,
 			},
 			prepare: func(s *intervalSegment) {
@@ -255,7 +256,7 @@ func TestIntervalSegment_GetDataFamilies(t *testing.T) {
 		{
 			name: "load segment successfully",
 			timeRange: timeutil.TimeRange{
-				Start: now - 2*timeutil.OneHour,
+				Start: now - 2*commontimeutil.OneHour,
 				End:   now,
 			},
 			prepare: func(s *intervalSegment) {
@@ -284,8 +285,8 @@ func TestIntervalSegment_GetDataFamilies(t *testing.T) {
 					segmentDir: segment,
 				},
 				interval: option.Interval{
-					Interval:  timeutil.Interval(timeutil.OneSecond * 10),
-					Retention: timeutil.Interval(timeutil.OneDay * 20),
+					Interval:  timeutil.Interval(commontimeutil.OneSecond * 10),
+					Retention: timeutil.Interval(commontimeutil.OneDay * 20),
 				},
 				logger: logger.GetLogger("test", "Segment"),
 			}
@@ -303,13 +304,13 @@ func TestIntervalSegment_TTL(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	now := timeutil.Now() - 40*timeutil.OneDay
-	segmentDir := timeutil.FormatTimestamp(now, "20060102")
+	now := commontimeutil.Now() - 40*commontimeutil.OneDay
+	segmentDir := commontimeutil.FormatTimestamp(now, "20060102")
 
 	segment := NewMockSegment(ctrl)
 	cases := []struct {
-		name    string
 		prepare func()
+		name    string
 		wantErr bool
 	}{
 		{
@@ -366,8 +367,8 @@ func TestIntervalSegment_TTL(t *testing.T) {
 			}()
 			s := &intervalSegment{
 				interval: option.Interval{
-					Interval:  timeutil.Interval(10 * timeutil.OneSecond),
-					Retention: timeutil.Interval(30 * timeutil.OneDay),
+					Interval:  timeutil.Interval(10 * commontimeutil.OneSecond),
+					Retention: timeutil.Interval(30 * commontimeutil.OneDay),
 				},
 				segments: map[string]Segment{
 					segmentDir: segment,
@@ -391,8 +392,8 @@ func TestIntervalSegment_EvictSegment(t *testing.T) {
 	segment := NewMockSegment(ctrl)
 	s := &intervalSegment{
 		interval: option.Interval{
-			Interval:  timeutil.Interval(10 * timeutil.OneSecond),
-			Retention: timeutil.Interval(30 * timeutil.OneDay),
+			Interval:  timeutil.Interval(10 * commontimeutil.OneSecond),
+			Retention: timeutil.Interval(30 * commontimeutil.OneDay),
 		},
 		segments: map[string]Segment{
 			segmentDir: segment,

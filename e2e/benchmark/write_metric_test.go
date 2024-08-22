@@ -24,44 +24,52 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
+	"sync"
 	"testing"
-	"time"
 
 	"github.com/go-http-utils/headers"
 	"github.com/go-resty/resty/v2"
-
+	"github.com/lindb/common/pkg/timeutil"
 	protoMetricsV1 "github.com/lindb/common/proto/gen/v1/linmetrics"
 
 	"github.com/lindb/lindb/constants"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/timeutil"
 	"github.com/lindb/lindb/series/metric"
 )
 
-func TestWriteSumMetric(b *testing.T) {
+const (
+	host          = "host"
+	disk          = "disk"
+	partition     = "partition"
+	internalDBURL = "http://127.0.0.1:9000/api/v1/write?db=_internal"
+	testDBURL     = "http://127.0.0.1:9000/api/v1/write?db=test"
+)
+
+func TestWrite_SumMetric(b *testing.T) {
 	timestamp := timeutil.Now()
 	cli := resty.New()
 	count := 0
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 4000; i++ {
 		var buf bytes.Buffer
 		for j := 0; j < 20; j++ {
-			for k := 0; k < 4; k++ {
+			for k := 0; k < 40; k++ {
 				var brokerRow metric.BrokerRow
 				converter := metric.NewProtoConverter(models.NewDefaultLimits())
 				err := converter.ConvertTo(&protoMetricsV1.Metric{
 					Name:      "host_disk_700",
 					Timestamp: timestamp,
 					Tags: []*protoMetricsV1.KeyValue{
-						{Key: "host", Value: "host" + strconv.Itoa(i)},
-						{Key: "disk", Value: "disk" + strconv.Itoa(i)},
-						{Key: "partition", Value: "partition" + strconv.Itoa(i)},
+						{Key: host, Value: host + strconv.Itoa(i)},
+						{Key: disk, Value: disk + strconv.Itoa(j)},
+						{Key: partition, Value: partition + strconv.Itoa(k)},
 					},
 					SimpleFields: []*protoMetricsV1.SimpleField{
-						{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: float64(k)},
-						{Name: "f2", Type: protoMetricsV1.SimpleFieldType_LAST, Value: float64(k)},
-						{Name: "f3", Type: protoMetricsV1.SimpleFieldType_FIRST, Value: float64(k)},
+						{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: float64(1)},
+						{Name: "f2", Type: protoMetricsV1.SimpleFieldType_LAST, Value: float64(2)},
+						{Name: "f3", Type: protoMetricsV1.SimpleFieldType_FIRST, Value: float64(3)},
 					},
 				}, &brokerRow)
+				count++
 				_, _ = brokerRow.WriteTo(&buf)
 				if err != nil {
 					panic(err)
@@ -71,7 +79,7 @@ func TestWriteSumMetric(b *testing.T) {
 		body := buf.Bytes()
 		r := cli.R()
 		r.Header.Set(headers.ContentType, constants.ContentTypeFlat)
-		_, err := r.SetBody(body).Put("http://127.0.0.1:9000/api/v1/write?db=_internal")
+		_, err := r.SetBody(body).Put(internalDBURL)
 		if err != nil {
 			panic(err)
 		}
@@ -94,9 +102,9 @@ func TestWriteSumMetric_OneDay(b *testing.T) {
 						Name:      "host_disk_3400",
 						Timestamp: timestamp + n*2000,
 						Tags: []*protoMetricsV1.KeyValue{
-							{Key: "host", Value: "host" + strconv.Itoa(i)},
-							{Key: "disk", Value: "disk" + strconv.Itoa(k)},
-							{Key: "partition", Value: "partition" + strconv.Itoa(j)},
+							{Key: host, Value: host + strconv.Itoa(i)},
+							{Key: disk, Value: disk + strconv.Itoa(k)},
+							{Key: partition, Value: partition + strconv.Itoa(j)},
 						},
 						SimpleFields: []*protoMetricsV1.SimpleField{
 							{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 1},
@@ -112,7 +120,7 @@ func TestWriteSumMetric_OneDay(b *testing.T) {
 		body := buf.Bytes()
 		r := cli.R()
 		r.Header.Set(headers.ContentType, constants.ContentTypeFlat)
-		_, err := r.SetBody(body).Put("http://127.0.0.1:9000/api/v1/write?db=_internal")
+		_, err := r.SetBody(body).Put(internalDBURL)
 		if err != nil {
 			panic(err)
 		}
@@ -121,25 +129,46 @@ func TestWriteSumMetric_OneDay(b *testing.T) {
 }
 
 func TestWriteSumMetric_7Days(b *testing.T) {
-	timestamp, _ := timeutil.ParseTimestamp("2022-06-05 00:00:00")
+	timestamp, _ := timeutil.ParseTimestamp("2024-05-06 00:00:00")
 	cli := resty.New()
-	for d := int64(0); d < 24; d++ {
+	var wait sync.WaitGroup
+	wait.Add(100)
+	for i := 0; i < 100; i++ {
+		j := i
+		go func() {
+			defer wait.Done()
+			tt := timestamp + int64(j)*timeutil.OneDay
+			for d := int64(0); d < 24; d++ {
+				for n := int64(0); n < 60; n++ {
+					tt = tt + n*timeutil.OneMinute + d*timeutil.OneHour
+					write(tt, cli)
+					fmt.Println("done hour")
+				}
+			}
+		}()
+	}
+	wait.Wait()
+}
+
+func write(timestamp int64, cli *resty.Client) {
+	for i := 0; i < 40; i++ {
 		var buf bytes.Buffer
-		for n := int64(0); n < 60; n++ {
-			for i := 0; i < 1; i++ {
+		for j := 0; j < 200; j++ {
+			for k := 0; k < 400; k++ {
 				var brokerRow metric.BrokerRow
 				converter := metric.NewProtoConverter(models.NewDefaultLimits())
-				fmt.Println(timeutil.FormatTimestamp(timestamp+n*timeutil.OneMinute+d*timeutil.OneHour, timeutil.DataTimeFormat2))
 				err := converter.ConvertTo(&protoMetricsV1.Metric{
-					Name:      "host_disk_170",
-					Timestamp: timestamp + n*timeutil.OneMinute + d*timeutil.OneHour,
+					Name:      "host_disk_700",
+					Timestamp: timestamp,
 					Tags: []*protoMetricsV1.KeyValue{
 						{Key: "host", Value: "host" + strconv.Itoa(i)},
-						{Key: "disk", Value: "disk" + strconv.Itoa(i)},
-						{Key: "partition", Value: "partition" + strconv.Itoa(i)},
+						{Key: "disk", Value: "disk" + strconv.Itoa(j)},
+						{Key: "partition", Value: "partition" + strconv.Itoa(k)},
 					},
 					SimpleFields: []*protoMetricsV1.SimpleField{
-						{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 1},
+						{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: float64(k)},
+						{Name: "f2", Type: protoMetricsV1.SimpleFieldType_LAST, Value: float64(k)},
+						{Name: "f3", Type: protoMetricsV1.SimpleFieldType_FIRST, Value: float64(k)},
 					},
 				}, &brokerRow)
 				_, _ = brokerRow.WriteTo(&buf)
@@ -151,10 +180,10 @@ func TestWriteSumMetric_7Days(b *testing.T) {
 		body := buf.Bytes()
 		r := cli.R()
 		r.Header.Set(headers.ContentType, constants.ContentTypeFlat)
-		_, err := r.SetBody(body).Put("http://127.0.0.1:9000/api/v1/write?db=test")
+		_, err := r.SetBody(body).Put(testDBURL)
 		if err != nil {
 			panic(err)
 		}
-		time.Sleep(5 * time.Second)
+		fmt.Println("done...")
 	}
 }

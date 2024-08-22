@@ -22,18 +22,21 @@ import (
 	"sort"
 	"strconv"
 	"testing"
+	"time"
 
 	xxhash "github.com/cespare/xxhash/v2"
 	flatbuffers "github.com/google/flatbuffers/go"
-	"github.com/stretchr/testify/assert"
-
-	"github.com/lindb/common/pkg/fasttime"
 	"github.com/lindb/common/proto/gen/v1/flatMetricsV1"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/lindb/lindb/series/field"
 )
 
-func buildFlatMetric(builder *flatbuffers.Builder) {
+const (
+	testCounter = "counter"
+)
+
+func buildFlatMetric(builder *flatbuffers.Builder, ns bool) {
 	builder.Reset()
 
 	var (
@@ -46,7 +49,7 @@ func buildFlatMetric(builder *flatbuffers.Builder) {
 	for i := 0; i < 10; i++ {
 		keys[i] = builder.CreateString("key" + strconv.Itoa(i))
 		values[i] = builder.CreateString("value" + strconv.Itoa(i))
-		fieldNames[i] = builder.CreateString("counter" + strconv.Itoa(i))
+		fieldNames[i] = builder.CreateString(testCounter + strconv.Itoa(i))
 	}
 	for i := 9; i >= 0; i-- {
 		flatMetricsV1.KeyValueStart(builder)
@@ -114,11 +117,14 @@ func buildFlatMetric(builder *flatbuffers.Builder) {
 	metricName := builder.CreateString("hello")
 	namespace := builder.CreateString("default-ns")
 	flatMetricsV1.MetricStart(builder)
-	flatMetricsV1.MetricAddNamespace(builder, namespace)
+	if ns {
+		flatMetricsV1.MetricAddNamespace(builder, namespace)
+	}
 	flatMetricsV1.MetricAddName(builder, metricName)
-	flatMetricsV1.MetricAddTimestamp(builder, fasttime.UnixMilliseconds())
+	flatMetricsV1.MetricAddTimestamp(builder, time.Now().UnixNano())
 	flatMetricsV1.MetricAddKeyValues(builder, kvsAt)
-	flatMetricsV1.MetricAddHash(builder, xxhash.Sum64String("hello"))
+	flatMetricsV1.MetricAddKvsHash(builder, xxhash.Sum64String("hello"))
+	flatMetricsV1.MetricAddNameHash(builder, xxhash.Sum64String("hello"))
 	flatMetricsV1.MetricAddSimpleFields(builder, fieldsAt)
 	flatMetricsV1.MetricAddCompoundField(builder, compoundField)
 
@@ -127,8 +133,8 @@ func buildFlatMetric(builder *flatbuffers.Builder) {
 }
 
 func Test_MetricRow_WithSimpleFields(t *testing.T) {
-	var builder = flatbuffers.NewBuilder(1024)
-	buildFlatMetric(builder)
+	builder := flatbuffers.NewBuilder(1024)
+	buildFlatMetric(builder, true)
 
 	var mr StorageRow
 	mr.Unmarshal(builder.FinishedBytes())
@@ -136,6 +142,7 @@ func Test_MetricRow_WithSimpleFields(t *testing.T) {
 	assert.Equal(t, "hello", string(mr.Name()))
 
 	assert.Equal(t, "default-ns", string(mr.NameSpace()))
+	assert.NotZero(t, mr.NameHash())
 	assert.NotZero(t, mr.TagsHash())
 	assert.Equal(t, 10, mr.TagsLen())
 	assert.Equal(t, 10, mr.SimpleFieldsLen())
@@ -161,8 +168,8 @@ func Test_MetricRow_WithSimpleFields(t *testing.T) {
 		sfItr.Reset()
 		var count int
 		for sfItr.HasNext() {
-			assert.Equal(t, "counter"+strconv.Itoa(count), string(sfItr.NextName()))
-			assert.Equal(t, "counter"+strconv.Itoa(count), string(sfItr.NextRawName()))
+			assert.Equal(t, testCounter+strconv.Itoa(count), string(sfItr.NextName()))
+			assert.Equal(t, testCounter+strconv.Itoa(count), string(sfItr.NextRawName()))
 			switch count {
 			case 0:
 				assert.Equal(t, field.LastField, sfItr.NextType())
@@ -191,12 +198,13 @@ func Test_MetricRow_WithSimpleFields(t *testing.T) {
 }
 
 func Test_MetricRow_WithCompoundField(t *testing.T) {
-	var builder = flatbuffers.NewBuilder(1024)
-	buildFlatMetric(builder)
+	builder := flatbuffers.NewBuilder(1024)
+	buildFlatMetric(builder, false)
 
 	var mr StorageRow
 	mr.Unmarshal(builder.FinishedBytes())
 
+	assert.Equal(t, "default-ns", string(mr.NameSpace()))
 	itr, ok := mr.NewCompoundFieldIterator()
 	assert.True(t, ok)
 	assert.NotNil(t, itr)
@@ -248,14 +256,16 @@ func Test_HistogramConverter(t *testing.T) {
 }
 
 func TestStorageBatchRows_Sorts(t *testing.T) {
-	var builder = flatbuffers.NewBuilder(1024)
-	buildFlatMetric(builder)
+	builder := flatbuffers.NewBuilder(1024)
+	buildFlatMetric(builder, true)
 
 	var mr1 StorageRow
 	mr1.Unmarshal(builder.FinishedBytes())
 	var mr2 StorageRow
+	buildFlatMetric(builder, true)
 	mr2.Unmarshal(builder.FinishedBytes())
 	rows := NewStorageBatchRows()
-	rows.rows = []StorageRow{mr1, mr2}
+	rows.appendIndex = 4
+	rows.rows = []*StorageRow{&mr1, &mr2, &mr1, &mr1, &mr2}
 	sort.Sort(rows)
 }

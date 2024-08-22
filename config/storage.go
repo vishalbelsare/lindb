@@ -25,7 +25,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lindb/lindb/pkg/ltoml"
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/ltoml"
 )
 
 // TSDB represents the tsdb configuration.
@@ -91,13 +92,12 @@ flush-concurrency = %d`,
 
 // StorageBase represents a storage configuration
 type StorageBase struct {
-	// Broker http endpoint, auto register current storage cluster.
 	BrokerEndpoint  string         `env:"BROKER_ENDPOINT" toml:"broker-endpoint"`
-	TTLTaskInterval ltoml.Duration `env:"TTL_TASK_INTERVAL" toml:"ttl-task-interval"`
+	WAL             WAL            `envPrefix:"WAL_" toml:"wal"`
+	TSDB            TSDB           `envPrefix:"TSDB_" toml:"tsdb"`
 	HTTP            HTTP           `envPrefix:"HTTP_" toml:"http"`
 	GRPC            GRPC           `envPrefix:"GRPC_" toml:"grpc"`
-	TSDB            TSDB           `envPrefix:"TSDB_" toml:"tsdb"`
-	WAL             WAL            `envPrefix:"WAL_" toml:"wal"`
+	TTLTaskInterval ltoml.Duration `env:"TTL_TASK_INTERVAL" toml:"ttl-task-interval"`
 }
 
 // TOML returns StorageBase's toml config string
@@ -109,10 +109,6 @@ func (s *StorageBase) TOML() string {
 ## Default: %s
 ## Env: LINDB_STORAGE_TTL_TASK_INTERVAL 
 ttl-task-interval = "%s"
-## Broker http endpoint which storage self register address
-## Default: %s
-## Env: LINDB_STORAGE_BROKER_ENDPOINT
-broker-endpoint = "%s"
 
 ## Storage HTTP related configuration.
 [storage.http]%s
@@ -127,8 +123,6 @@ broker-endpoint = "%s"
 [storage.tsdb]%s`,
 		s.TTLTaskInterval,
 		s.TTLTaskInterval,
-		s.BrokerEndpoint,
-		s.BrokerEndpoint,
 		s.HTTP.TOML(),
 		s.GRPC.TOML(),
 		s.WAL.TOML(),
@@ -139,18 +133,18 @@ broker-endpoint = "%s"
 // WAL represents config for write ahead log in storage.
 type WAL struct {
 	Dir                string         `env:"DIR" toml:"dir"`
-	DataSizeLimit      ltoml.Size     `env:"DATA_SIZE_LIMIT" toml:"data-size-limit"`
+	PageSize           ltoml.Size     `env:"PAGE_SIZE" toml:"page-size"`
 	RemoveTaskInterval ltoml.Duration `env:"REMOVE_TASK_INTERVAL" toml:"remove-task-interval"`
 }
 
-func (rc *WAL) GetDataSizeLimit() int64 {
-	if rc.DataSizeLimit <= 0 {
-		return 1024 * 1024 // 1MB
+func (rc *WAL) GetPageSize() int64 {
+	if rc.PageSize <= 0 {
+		return 128 * 1024 * 1024 // 128MB
 	}
-	if rc.DataSizeLimit >= 1024*1024*1024 {
+	if rc.PageSize >= 1024*1024*1024 {
 		return 1024 * 1024 * 1024 // 1GB
 	}
-	return int64(rc.DataSizeLimit)
+	return int64(rc.PageSize)
 }
 
 func (rc *WAL) TOML() string {
@@ -159,19 +153,19 @@ func (rc *WAL) TOML() string {
 ## Default: %s
 ## Env: LINDB_STORAGE_WAL_DIR
 dir = "%s"
-## data-size-limit is the maximum size in megabytes of the page file before a new
-## file is created. It defaults to 512 megabytes, available size is in [1MB, 1GB]
+## page-size is the maximum page size in megabytes of the page file before a new
+## file is created, available size is in [128MB, 1GB]
 ## Default: %s
-## Env: LINDB_STORAGE_WAL_DATA_SIZE_LIMIT
-data-size-limit = "%s"
+## Env: LINDB_STORAGE_WAL_PAGE_SIZE
+page-size = "%s"
 ## interval for how often remove expired write ahead log
 ## Default: %s
 ## Env: LINDB_STORAGE_WAL_REMOVE_TASK_INTERVAL
 remove-task-interval = "%s"`,
 		strings.ReplaceAll(rc.Dir, "\\", "\\\\"),
 		strings.ReplaceAll(rc.Dir, "\\", "\\\\"),
-		rc.DataSizeLimit.String(),
-		rc.DataSizeLimit.String(),
+		rc.PageSize.String(),
+		rc.PageSize.String(),
 		rc.RemoveTaskInterval.String(),
 		rc.RemoveTaskInterval.String(),
 	)
@@ -179,11 +173,11 @@ remove-task-interval = "%s"`,
 
 // Storage represents a storage configuration with common settings
 type Storage struct {
-	Coordinator RepoState   `envPrefix:"LINDB_COORDINATOR_" toml:"coordinator"`
-	Query       Query       `envPrefix:"LINDB_QUERY_" toml:"query"`
-	StorageBase StorageBase `envPrefix:"LINDB_STORAGE_" toml:"storage"`
-	Monitor     Monitor     `envPrefix:"LINDB_MONITOR_" toml:"monitor"`
-	Logging     Logging     `envPrefix:"LINDB_LOGGING_" toml:"logging"`
+	Coordinator RepoState      `envPrefix:"LINDB_COORDINATOR_" toml:"coordinator"`
+	Monitor     Monitor        `envPrefix:"LINDB_MONITOR_" toml:"monitor"`
+	Logging     logger.Setting `envPrefix:"LINDB_LOGGING_" toml:"logging"`
+	StorageBase StorageBase    `envPrefix:"LINDB_STORAGE_" toml:"storage"`
+	Query       Query          `envPrefix:"LINDB_QUERY_" toml:"query"`
 }
 
 // TOML returns storage's configuration string as toml format.
@@ -200,7 +194,7 @@ func (s *Storage) TOML() string {
 		s.Query.TOML(),
 		s.StorageBase.TOML(),
 		s.Monitor.TOML(),
-		s.Logging.TOML(),
+		s.Logging.TOML("LINDB"),
 	)
 }
 
@@ -208,7 +202,6 @@ func (s *Storage) TOML() string {
 func NewDefaultStorageBase() *StorageBase {
 	return &StorageBase{
 		TTLTaskInterval: ltoml.Duration(time.Hour * 24),
-		BrokerEndpoint:  "http://localhost:9000",
 		HTTP: HTTP{
 			Port:         2892,
 			IdleTimeout:  ltoml.Duration(time.Minute * 2),
@@ -222,7 +215,7 @@ func NewDefaultStorageBase() *StorageBase {
 		},
 		WAL: WAL{
 			Dir:                filepath.Join(defaultParentDir, "storage", "wal"),
-			DataSizeLimit:      ltoml.Size(128 * 1024 * 1024),
+			PageSize:           ltoml.Size(128 * 1024 * 1024),
 			RemoveTaskInterval: ltoml.Duration(time.Minute),
 		},
 		TSDB: TSDB{
@@ -252,7 +245,7 @@ func NewDefaultStorageTOML() string {
 		NewDefaultQuery().TOML(),
 		NewDefaultStorageBase().TOML(),
 		NewDefaultMonitor().TOML(),
-		NewDefaultLogging().TOML(),
+		logger.NewDefaultSetting().TOML("LINDB"),
 	)
 }
 

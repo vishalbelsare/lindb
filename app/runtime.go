@@ -20,11 +20,12 @@ package app
 import (
 	"context"
 
+	"github.com/lindb/common/pkg/logger"
+
 	"github.com/lindb/lindb/config"
 	"github.com/lindb/lindb/internal/linmetric"
 	"github.com/lindb/lindb/internal/monitoring"
 	"github.com/lindb/lindb/metrics"
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/series/tag"
 )
 
@@ -36,12 +37,11 @@ var (
 // BaseRuntime represents the common logic of runtime.
 type BaseRuntime struct {
 	ctx             context.Context
-	monitor         config.Monitor
-	registry        *linmetric.Registry
 	pusher          monitoring.NativePusher
+	logger          logger.Logger
+	registry        *linmetric.Registry
+	monitor         config.Monitor
 	globalKeyValues tag.Tags
-
-	logger *logger.Logger
 }
 
 // NewBaseRuntime creates a base runtime instance.

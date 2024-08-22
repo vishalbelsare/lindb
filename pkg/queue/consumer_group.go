@@ -22,9 +22,9 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/lindb/common/pkg/logger"
 	"go.uber.org/atomic"
 
-	"github.com/lindb/lindb/pkg/logger"
 	"github.com/lindb/lindb/pkg/queue/page"
 )
 
@@ -66,17 +66,15 @@ type ConsumerGroup interface {
 
 // consumerGroup implements ConsumerGroup.
 type consumerGroup struct {
-	name string      // unique name
-	q    FanOutQueue // underlying queue for retrieving data
-
-	consumedSeq     *atomic.Int64 // consumed sequence
-	acknowledgedSeq *atomic.Int64 // acknowledged sequence
+	q               FanOutQueue // underlying query for retreving data
 	metaPageFct     page.Factory
 	metaPage        page.MappedPage // persists meta
-
-	closed       atomic.Bool // false -> running, true -> closed
-	paused       atomic.Bool
-	lock4headSeq sync.RWMutex // lock to protect headSeq
+	consumedSeq     *atomic.Int64   // consumed sequence
+	acknowledgedSeq *atomic.Int64   // acknowledged sequence
+	name            string          // unique name
+	closed          atomic.Bool     // false -> running, true -> closed
+	paused          atomic.Bool
+	lock4headSeq    sync.RWMutex // lock to protect head seq
 }
 
 // NewConsumerGroup builds a ConsumerGroup from metaPath.
@@ -196,7 +194,7 @@ func (f *consumerGroup) Ack(ackSeq int64) {
 	hs := f.ConsumedSeq()
 	// In the initial condition, ts == 0, if the first acknowledgedSeq == 0, it would be ignored.
 	// Since ack is always in batch mode and the following ack will ack the previous data, it's not big problem.
-	if ackSeq > ts && ackSeq <= hs {
+	if ackSeq >= ts && ackSeq <= hs {
 		f.acknowledgedSeq.Store(ackSeq)
 
 		f.metaPage.PutUint64(uint64(f.ConsumedSeq()), consumerGroupConsumedSeqOffset)
@@ -259,7 +257,7 @@ func (f *consumerGroup) IsEmpty() bool {
 
 // Close persists headSeq, tailSeq.
 func (f *consumerGroup) Close() {
-	if f.closed.CAS(false, true) {
+	if f.closed.CompareAndSwap(false, true) {
 		f.Queue().Queue().Signal()
 
 		if err := f.metaPageFct.Close(); err != nil {

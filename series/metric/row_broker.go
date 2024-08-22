@@ -23,22 +23,19 @@ import (
 	"sync"
 
 	flatbuffers "github.com/google/flatbuffers/go"
-	jump "github.com/lithammer/go-jump-consistent-hash"
-
 	"github.com/lindb/common/pkg/encoding"
 	"github.com/lindb/common/pkg/fasttime"
 	"github.com/lindb/common/proto/gen/v1/flatMetricsV1"
+	jump "github.com/lithammer/go-jump-consistent-hash"
 
 	"github.com/lindb/lindb/pkg/timeutil"
 )
 
 type BrokerRow struct {
-	m      flatMetricsV1.Metric
 	buffer []byte
 
-	shardIdx int
-	// IsOutOfTimeRange marks if this row is out-of time-range
-	// data is not accessible when its set to true
+	m                flatMetricsV1.Metric
+	shardIdx         int
 	IsOutOfTimeRange bool
 }
 
@@ -72,10 +69,9 @@ var brokerBatchRowsPool sync.Pool
 // BrokerBatchRows holds rows from ingestion
 // row will be putted into buffer after validation and re-building
 type BrokerBatchRows struct {
-	rows     []BrokerRow
-	rowCount int
-
+	rows               []BrokerRow
 	shardGroupIterator BrokerBatchShardIterator
+	rowCount           int
 }
 
 func newBrokerBatchRows() *BrokerBatchRows {
@@ -136,7 +132,7 @@ func (br *BrokerBatchRows) TryAppend(appendFunc func(row *BrokerRow) error) erro
 
 func (br *BrokerBatchRows) NewShardGroupIterator(numOfShards int32) *BrokerBatchShardIterator {
 	for i := 0; i < br.Len(); i++ {
-		br.rows[i].shardIdx = int(jump.Hash(br.rows[i].m.Hash(), numOfShards))
+		br.rows[i].shardIdx = int(jump.Hash(br.rows[i].m.KvsHash(), numOfShards))
 	}
 	br.shardGroupIterator.batch = br
 	br.shardGroupIterator.Reset()
@@ -146,13 +142,12 @@ func (br *BrokerBatchRows) NewShardGroupIterator(numOfShards int32) *BrokerBatch
 // BrokerBatchShardIterator grouping broker rows with shard-id,
 // rows will be batched inserted into shard-channel for replication
 type BrokerBatchShardIterator struct {
+	batch          *BrokerBatchRows
+	familyIterator BrokerBatchShardFamilyIterator
+
 	groupEnd      int // group end index
 	groupStart    int // group start index
 	groupShardIdx int // group shard index in shards list
-
-	batch *BrokerBatchRows
-
-	familyIterator BrokerBatchShardFamilyIterator
 }
 
 // Reset re-sorts batch rows for batching inserting

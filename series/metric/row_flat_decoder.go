@@ -23,7 +23,6 @@ import (
 	"sync"
 
 	flatbuffers "github.com/google/flatbuffers/go"
-
 	commonseries "github.com/lindb/common/series"
 
 	"github.com/lindb/lindb/constants"
@@ -31,26 +30,20 @@ import (
 	"github.com/lindb/lindb/series/tag"
 )
 
-var (
-	maxRowLength = 10 * 1024
-)
+var maxRowLength = 10 * 1024
 
 type BrokerRowFlatDecoder struct {
-	reader  io.Reader
-	size    int // head length
-	buf     []byte
-	readLen int
-
-	rowBuilder commonseries.RowBuilder
-	originRow  readOnlyRow // used for unmarshal
-
+	reader         io.Reader
+	limits         *models.Limits
+	rowBuilder     commonseries.RowBuilder
+	buf            []byte
 	compoundValues []float64
 	compoundBounds []float64
-
-	namespace    []byte
-	enrichedTags tag.Tags
-
-	limits *models.Limits
+	namespace      []byte
+	enrichedTags   tag.Tags
+	originRow      readOnlyRow // used for unmarshal
+	size           int         // head length
+	readLen        int
 }
 
 var brokerRowFlatDecoderPool sync.Pool
@@ -163,7 +156,7 @@ func (itr *BrokerRowFlatDecoder) rebuild() error {
 		}
 	}
 
-	if itr.limits.EnableFieldsCheck() && itr.originRow.SimpleFieldsLen() > int(itr.limits.MaxFieldsPerMetric) {
+	if itr.limits.EnableFieldsCheck() && itr.originRow.SimpleFieldsLen() > itr.limits.MaxFieldsPerMetric {
 		return constants.ErrTooManyFields
 	}
 	simpleFieldItr := itr.originRow.NewSimpleFieldIterator()

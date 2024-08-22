@@ -22,17 +22,18 @@ import (
 	"os"
 	"testing"
 
-	"github.com/golang/mock/gomock"
+	commonfileutil "github.com/lindb/common/pkg/fileutil"
+	"github.com/lindb/common/pkg/logger"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 
 	"github.com/lindb/lindb/pkg/fileutil"
-	"github.com/lindb/lindb/pkg/logger"
 )
 
 func TestNewFactory(t *testing.T) {
 	tmpDir := t.TempDir()
 	defer func() {
-		listDirFunc = fileutil.ListDir
+		listDirFunc = commonfileutil.ListDir
 		mapFileFunc = fileutil.RWMap
 	}()
 	// case 1: list page files err
@@ -78,7 +79,7 @@ func TestNewFactory(t *testing.T) {
 func TestFactory_AcquirePage(t *testing.T) {
 	tmpDir := t.TempDir()
 	defer func() {
-		mkDirFunc = fileutil.MkDirIfNotExist
+		mkDirFunc = commonfileutil.MkDirIfNotExist
 		mapFileFunc = fileutil.RWMap
 	}()
 	// case 1: new factory err
@@ -89,7 +90,7 @@ func TestFactory_AcquirePage(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, fct)
 
-	mkDirFunc = fileutil.MkDirIfNotExist
+	mkDirFunc = commonfileutil.MkDirIfNotExist
 
 	// case 2: new factory success
 	fct, err = NewFactory(tmpDir, 128)
@@ -152,7 +153,7 @@ func TestFactory_TruncatePages(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	defer func() {
-		removeFileFunc = fileutil.RemoveFile
+		removeFileFunc = commonfileutil.RemoveFile
 		ctrl.Finish()
 	}()
 
@@ -161,7 +162,7 @@ func TestFactory_TruncatePages(t *testing.T) {
 	p, err := fct.AcquirePage(10)
 	assert.NoError(t, err)
 	assert.NotNil(t, p)
-	files, err := fileutil.ListDir(tmpDir)
+	files, err := commonfileutil.ListDir(tmpDir)
 	assert.NoError(t, err)
 	assert.Len(t, files, 1)
 
@@ -172,15 +173,15 @@ func TestFactory_TruncatePages(t *testing.T) {
 		return fmt.Errorf("err")
 	}
 	fct.TruncatePages(11)
-	files, err = fileutil.ListDir(tmpDir)
+	files, err = commonfileutil.ListDir(tmpDir)
 	assert.NoError(t, err)
 	assert.Len(t, files, 1)
 
 	// remove file success
-	removeFileFunc = fileutil.RemoveFile
+	removeFileFunc = commonfileutil.RemoveFile
 	fct.TruncatePages(11)
 	assert.NoError(t, err)
-	files, err = fileutil.ListDir(tmpDir)
+	files, err = commonfileutil.ListDir(tmpDir)
 	assert.NoError(t, err)
 	assert.Len(t, files, 0)
 

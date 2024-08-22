@@ -21,21 +21,28 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
-	"github.com/stretchr/testify/assert"
-
+	commontimeutil "github.com/lindb/common/pkg/timeutil"
 	protoMetricsV1 "github.com/lindb/common/proto/gen/v1/linmetrics"
+	"github.com/lindb/roaring"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 
 	"github.com/lindb/lindb/flow"
+	"github.com/lindb/lindb/index"
+	"github.com/lindb/lindb/kv"
 	"github.com/lindb/lindb/models"
+	"github.com/lindb/lindb/pkg/encoding"
 	"github.com/lindb/lindb/pkg/timeutil"
 	"github.com/lindb/lindb/series/field"
 	"github.com/lindb/lindb/series/metric"
-	stmtpkg "github.com/lindb/lindb/sql/stmt"
+	"github.com/lindb/lindb/sql/stmt"
 	"github.com/lindb/lindb/tsdb/tblstore/metricsdata"
 )
 
@@ -45,45 +52,215 @@ func TestMemoryDatabase_New(t *testing.T) {
 		ctrl.Finish()
 	}()
 
+	indexDB := NewMockIndexDatabase(ctrl)
 	bufferMgr := NewMockBufferManager(ctrl)
 	cfg := MemoryDatabaseCfg{
-		FamilyTime: 10,
-		BufferMgr:  bufferMgr,
+		FamilyTime:    10,
+		BufferMgr:     bufferMgr,
+		IndexDatabase: indexDB,
 	}
-	buf := NewMockDataPointBuffer(ctrl)
-	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(buf, nil)
-	mdINTF, err := NewMemoryDatabase(cfg)
+	mdINTF, err := NewMemoryDatabase(&cfg)
 	assert.NoError(t, err)
 	assert.NotNil(t, mdINTF)
 	assert.Equal(t, int64(10), mdINTF.FamilyTime())
 	assert.False(t, mdINTF.IsReadOnly())
+	assert.Zero(t, mdINTF.NumOfSeries())
+	assert.Zero(t, mdINTF.MemSize())
+	l := mdINTF.WithLock()
+	l()
 	mdINTF.MarkReadOnly()
 	assert.True(t, mdINTF.IsReadOnly())
-	buf.EXPECT().Release()
+	md := mdINTF.(*memoryDatabase)
+	indexDB.EXPECT().Cleanup(md)
 	err = mdINTF.Close()
 	assert.NoError(t, err)
 	time.Sleep(time.Millisecond * 100)
 	assert.True(t, mdINTF.Uptime() > 0)
+}
 
-	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(nil, fmt.Errorf("err"))
-	mdINTF, err = NewMemoryDatabase(cfg)
+func TestDatabase_Write(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	name := "./db_write"
+	defer func() {
+		_ = os.RemoveAll(name)
+		ctrl.Finish()
+	}()
+	metaDB := index.NewMockMetricMetaDatabase(ctrl)
+	metaDB.EXPECT().GenMetricID(gomock.Any(), gomock.Any()).Return(metric.ID(1), nil).AnyTimes()
+	metaDB.EXPECT().GenFieldID(gomock.Any(), gomock.Any()).Return(field.ID(2), nil).AnyTimes()
+	indexDB := index.NewMockMetricIndexDatabase(ctrl)
+	indexDB.EXPECT().GenSeriesID(gomock.Any(), gomock.Any()).Return(uint32(100), nil).AnyTimes()
+	memMetaDB := NewMetadataDatabase(&models.DatabaseConfig{}, metaDB)
+	memIndexDB := NewIndexDatabase(memMetaDB, indexDB)
+	bufferMgr := NewBufferManager(path.Join(name, "buf"))
+	interval := timeutil.Interval(10_000)
+	now, _ := commontimeutil.ParseTimestamp("2023-01-01 22:23:00", commontimeutil.DataTimeFormat2)
+	familyTime := interval.Calculator().CalcFamilyTime(now)
+	cfg := &MemoryDatabaseCfg{
+		FamilyTime:    familyTime,
+		BufferMgr:     bufferMgr,
+		IndexDatabase: memIndexDB,
+		Interval:      interval,
+		IntervalCalc:  interval.Calculator(),
+	}
+	db, err := NewMemoryDatabase(cfg)
+	assert.NoError(t, err)
+	assert.NotNil(t, db)
+	m := &protoMetricsV1.Metric{
+		Name:      "test1",
+		Namespace: "ns",
+		Timestamp: now,
+		Tags:      []*protoMetricsV1.KeyValue{{Key: "key1", Value: "value1"}},
+		SimpleFields: []*protoMetricsV1.SimpleField{
+			{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 10},
+		},
+	}
+
+	row := protoToStorageRow(m)
+	assert.NoError(t, db.WriteRow(row))
+	// write old time, compress data
+	m.Timestamp = now - 20_1000
+	row = protoToStorageRow(m)
+	assert.NoError(t, db.WriteRow(row))
+	m.Tags = []*protoMetricsV1.KeyValue{{Key: "key2", Value: "value2"}}
+	m.SimpleFields = append(m.SimpleFields, &protoMetricsV1.SimpleField{
+		Name: "f2", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 10,
+	})
+	assert.NoError(t, db.WriteRow(protoToStorageRow(m)))
+	row = protoToStorageRow(&protoMetricsV1.Metric{
+		Name:      "test2",
+		Namespace: "ns",
+		Timestamp: now,
+		SimpleFields: []*protoMetricsV1.SimpleField{
+			{Name: "f4", Type: protoMetricsV1.SimpleFieldType_LAST, Value: 10},
+		},
+		CompoundField: &protoMetricsV1.CompoundField{
+			Min:            10,
+			Max:            10,
+			Sum:            10,
+			Count:          10,
+			ExplicitBounds: []float64{1, 1, 1, 1, 1, math.Inf(1) + 1},
+			Values:         []float64{1, 1, 1, 1, 1, 1},
+		},
+	})
+	assert.NoError(t, db.WriteRow(row))
+	assert.NotZero(t, db.MemSize())
+	assert.False(t, db.MemTimeSeriesIDs().IsEmpty())
+
+	// wait meta/index update
+	time.Sleep(500 * time.Millisecond)
+	ctx := &flow.ShardExecuteContext{
+		StorageExecuteCtx: &flow.StorageExecuteContext{
+			MetricID: 1,
+			Fields:   field.Metas{{Name: "f1", Type: field.SumField}},
+			Query: &stmt.Query{
+				TimeRange:       timeutil.TimeRange{Start: now - 200, End: now + 200},
+				StorageInterval: interval,
+			},
+		},
+		SeriesIDsAfterFiltering: roaring.BitmapOf(0, 100, 2),
+	}
+	db.MarkReadOnly()
+	rs, err := db.Filter(ctx)
+	assert.NoError(t, err)
+	assert.Len(t, rs, 1)
+	assert.True(t, strings.HasSuffix(rs[0].Identifier(), "/memory/readonly"))
+	assert.Equal(t, cfg.FamilyTime, rs[0].FamilyTime())
+	assert.True(t, rs[0].SlotRange().End > 0)
+	assert.Equal(t, []uint32{100}, rs[0].SeriesIDs().ToArray())
+	assert.Nil(t, rs[0].Load(&flow.DataLoadContext{
+		SeriesIDHighKey: 10,
+	}))
+	assert.Nil(t, rs[0].Load(&flow.DataLoadContext{
+		SeriesIDHighKey:       0,
+		LowSeriesIDsContainer: roaring.BitmapOf(1000).GetContainer(0),
+	}))
+	loader := rs[0].Load(&flow.DataLoadContext{
+		SeriesIDHighKey:       0,
+		LowSeriesIDsContainer: roaring.BitmapOf(0, 1).GetContainer(0),
+	})
+	assert.NotNil(t, loader)
+	loader.Load(&flow.DataLoadContext{
+		SeriesIDHighKey:       0,
+		LowSeriesIDsContainer: roaring.BitmapOf(0, 1).GetContainer(0),
+		LowSeriesIDs:          []uint16{0, 1},
+		DownSampling:          func(slotRange timeutil.SlotRange, seriesIdx uint16, fieldIdx int, getter encoding.TSDValueGetter) {},
+	})
+	rs[0].Close()
+	fm := ctx.StorageExecuteCtx.Fields
+	// field not match
+	ctx.StorageExecuteCtx.Fields = field.Metas{{Name: "xxx"}}
+	ctx.SeriesIDsAfterFiltering = roaring.BitmapOf(100)
+	rs, err = db.Filter(ctx)
 	assert.Error(t, err)
-	assert.Nil(t, mdINTF)
+	assert.Len(t, rs, 0)
+	ctx.StorageExecuteCtx.Fields = fm
+	// series not match
+	ctx.SeriesIDsAfterFiltering = roaring.BitmapOf(1000)
+	rs, err = db.Filter(ctx)
+	assert.Error(t, err)
+	assert.Len(t, rs, 0)
+	ctx.SeriesIDsAfterFiltering = roaring.BitmapOf(0, 100, 2)
+	// timerange not match
+	ctx.StorageExecuteCtx.Query.TimeRange = timeutil.TimeRange{
+		Start: now - 1000_000,
+		End:   now - 500_000,
+	}
+	rs, err = db.Filter(ctx)
+	assert.NoError(t, err)
+	assert.Len(t, rs, 0)
+
+	ctx.StorageExecuteCtx.MetricID = 10
+	rs, err = db.Filter(ctx)
+	assert.NoError(t, err)
+	assert.Len(t, rs, 0)
+
+	kvStore, err := kv.GetStoreManager().CreateStore(path.Join(name, "data"), kv.StoreOption{Levels: 2})
+	assert.NoError(t, err)
+	family, err := kvStore.CreateFamily("10", kv.FamilyOption{
+		Merger: string(metricsdata.MetricDataMerger),
+	})
+	assert.NoError(t, err)
+	kvFlusher := family.NewFlusher()
+	defer kvFlusher.Release()
+
+	flusher, err := metricsdata.NewFlusher(kvFlusher)
+	assert.NoError(t, err)
+
+	assert.NoError(t, db.FlushFamilyTo(flusher))
+
+	snapshot := family.GetSnapshot()
+	defer snapshot.Close()
+	c := 0
+	assert.NoError(t, snapshot.Load(1, func(value []byte) error {
+		c++
+		r, err := metricsdata.NewReader("dd", value)
+		assert.NoError(t, err)
+		assert.NotNil(t, r)
+		return nil
+	}))
+	assert.Equal(t, 1, c)
+
+	assert.NoError(t, db.Close())
 }
 
 func TestMemoryDatabase_AcquireWrite(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
+	indexDB := NewMockIndexDatabase(ctrl)
+	metaDB := NewMockMetadataDatabase(ctrl)
+	indexDB.EXPECT().GetMetadataDatabase().Return(metaDB).AnyTimes()
 	bufferMgr := NewMockBufferManager(ctrl)
 	cfg := MemoryDatabaseCfg{
-		BufferMgr: bufferMgr,
+		BufferMgr:     bufferMgr,
+		IndexDatabase: indexDB,
 	}
 	buf, err := newDataPointBuffer(filepath.Join(t.TempDir(), "db_dir"))
 	assert.NoError(t, err)
 
 	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(buf, nil).AnyTimes()
 
-	mdINTF, err := NewMemoryDatabase(cfg)
+	mdINTF, err := NewMemoryDatabase(&cfg)
 	assert.NoError(t, err)
 	assert.NotNil(t, mdINTF)
 	mdINTF.AcquireWrite()
@@ -93,9 +270,268 @@ func TestMemoryDatabase_AcquireWrite(t *testing.T) {
 		mdINTF.CompleteWrite()
 	}()
 	flusher := metricsdata.NewMockFlusher(ctrl)
+	metaDB.EXPECT().GetMetricIDs().Return(roaring.New())
 	flusher.EXPECT().Close().Return(nil)
 	err = mdINTF.FlushFamilyTo(flusher)
 	assert.NoError(t, err)
+}
+
+func TestDatabase_Filter_NoData(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	metaDB := NewMockMetadataDatabase(ctrl)
+	indexDB := NewMockIndexDatabase(ctrl)
+	indexDB.EXPECT().GetMetadataDatabase().Return(metaDB).AnyTimes()
+	metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(10), true).AnyTimes()
+	db := &memoryDatabase{
+		indexDB: indexDB,
+	}
+	ctx := &flow.ShardExecuteContext{
+		StorageExecuteCtx: &flow.StorageExecuteContext{
+			MetricID: 10,
+		},
+	}
+	indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(nil, false)
+	rs, err := db.Filter(ctx)
+	assert.NoError(t, err)
+	assert.Empty(t, rs)
+
+	timeSeriesIndex := NewMockTimeSeriesIndex(ctrl)
+	indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(timeSeriesIndex, true)
+	timeSeriesIndex.EXPECT().GetTimeRange(gomock.Any()).Return(nil, false)
+	rs, err = db.Filter(ctx)
+	assert.NoError(t, err)
+	assert.Empty(t, rs)
+}
+
+func TestMemoryDatabase_Write_Error(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	name := "./db_write_error"
+	defer func() {
+		_ = os.RemoveAll(name)
+		ctrl.Finish()
+	}()
+	metaDB := index.NewMockMetricMetaDatabase(ctrl)
+	metaDB.EXPECT().GenMetricID(gomock.Any(), gomock.Any()).Return(metric.ID(1), nil).AnyTimes()
+	metaDB.EXPECT().GenFieldID(gomock.Any(), gomock.Any()).Return(field.ID(2), nil).AnyTimes()
+	indexDB := index.NewMockMetricIndexDatabase(ctrl)
+	indexDB.EXPECT().GenSeriesID(gomock.Any(), gomock.Any()).Return(uint32(100), nil).AnyTimes()
+	memMetaDB := NewMetadataDatabase(&models.DatabaseConfig{}, metaDB)
+	memIndexDB := NewIndexDatabase(memMetaDB, indexDB)
+	interval := timeutil.Interval(10_000)
+	bufferMgr := NewMockBufferManager(ctrl)
+	buf := NewMockDataPointBuffer(ctrl)
+	now, _ := commontimeutil.ParseTimestamp("2023-01-01 22:23:00", commontimeutil.DataTimeFormat2)
+	familyTime := interval.Calculator().CalcFamilyTime(now)
+	cfg := MemoryDatabaseCfg{
+		FamilyTime:    familyTime,
+		BufferMgr:     bufferMgr,
+		IndexDatabase: memIndexDB,
+		IntervalCalc:  interval.Calculator(),
+		Interval:      interval,
+	}
+	db, err := NewMemoryDatabase(&cfg)
+	assert.NoError(t, err)
+	m := &protoMetricsV1.Metric{
+		Name:      "test1",
+		Timestamp: now,
+		SimpleFields: []*protoMetricsV1.SimpleField{
+			{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 10},
+		},
+	}
+	// write sample field error
+	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(nil, fmt.Errorf("err"))
+	assert.Error(t, db.WriteRow(protoToStorageRow(m)))
+
+	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(buf, nil).AnyTimes()
+
+	m.SimpleFields = nil
+	m.CompoundField = &protoMetricsV1.CompoundField{
+		Min:            10,
+		Max:            10,
+		Sum:            10,
+		Count:          10,
+		ExplicitBounds: []float64{1, 1, 1, 1, 1, math.Inf(1) + 1},
+		Values:         []float64{1, 1, 1, 1, 1, 1},
+	}
+	// write histogram min error
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(nil, fmt.Errorf("err"))
+	assert.Error(t, db.WriteRow(protoToStorageRow(m)))
+	// write histogram max error
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(make([]byte, 128), nil)
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(nil, fmt.Errorf("err"))
+	assert.Error(t, db.WriteRow(protoToStorageRow(m)))
+	// write histogram sum error
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(make([]byte, 128), nil).MaxTimes(2)
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(nil, fmt.Errorf("err"))
+	assert.Error(t, db.WriteRow(protoToStorageRow(m)))
+	// write histogram count error
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(make([]byte, 128), nil).MaxTimes(3)
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(nil, fmt.Errorf("err"))
+	assert.Error(t, db.WriteRow(protoToStorageRow(m)))
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(make([]byte, 128), nil).MaxTimes(4)
+	buf.EXPECT().GetOrCreatePage(gomock.Any()).Return(nil, fmt.Errorf("err"))
+	assert.Error(t, db.WriteRow(protoToStorageRow(m)))
+}
+
+func TestMemoryDatabase_Flush_Error(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	indexDB := NewMockIndexDatabase(ctrl)
+	metaDB := NewMockMetadataDatabase(ctrl)
+	mStore := NewMockmStoreINTF(ctrl)
+	timeSeriesIndex := NewMockTimeSeriesIndex(ctrl)
+	buf := NewMockDataPointBuffer(ctrl)
+	indexDB.EXPECT().GetMetadataDatabase().Return(metaDB).AnyTimes()
+	db := &memoryDatabase{
+		indexDB:       indexDB,
+		timeSeriesIDs: roaring.BitmapOf(1, 2),
+	}
+	db.fieldWriteStores.Store(uint8(1), buf)
+	flusher := metricsdata.NewMockFlusher(ctrl)
+
+	cases := []struct {
+		prepare func()
+		name    string
+		wantErr bool
+	}{
+		{
+			name: "metric ids not found",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.New())
+				flusher.EXPECT().Close().Return(nil)
+			},
+		},
+		{
+			name: "memory metric id not found",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), false)
+				flusher.EXPECT().Close().Return(nil)
+			},
+		},
+		{
+			name: "memory metric meta not found",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), true)
+				metaDB.EXPECT().GetMetricMeta(gomock.Any()).Return(nil, false)
+				flusher.EXPECT().Close().Return(nil)
+			},
+		},
+		{
+			name: "time series index not found",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), true)
+				metaDB.EXPECT().GetMetricMeta(gomock.Any()).Return(mStore, true)
+				indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(nil, false)
+				flusher.EXPECT().Close().Return(nil)
+			},
+		},
+		{
+			name: "time range not found",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), true)
+				metaDB.EXPECT().GetMetricMeta(gomock.Any()).Return(mStore, true)
+				indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(timeSeriesIndex, true)
+				timeSeriesIndex.EXPECT().GetTimeRange(gomock.Any()).Return(nil, false)
+				flusher.EXPECT().Close().Return(nil)
+			},
+		},
+		{
+			name: "time series not match",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), true)
+				metaDB.EXPECT().GetMetricMeta(gomock.Any()).Return(mStore, true)
+				indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(timeSeriesIndex, true)
+				timeSeriesIndex.EXPECT().GetTimeRange(gomock.Any()).Return(&timeutil.SlotRange{}, true)
+				timeSeriesIndex.EXPECT().MemTimeSeriesIDs().Return(roaring.BitmapOf(100))
+				flusher.EXPECT().Close().Return(nil)
+			},
+		},
+		{
+			name: "field data not found",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), true)
+				metaDB.EXPECT().GetMetricMeta(gomock.Any()).Return(mStore, true)
+				indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(timeSeriesIndex, true)
+				timeSeriesIndex.EXPECT().GetTimeRange(gomock.Any()).Return(&timeutil.SlotRange{}, true)
+				timeSeriesIndex.EXPECT().MemTimeSeriesIDs().Return(roaring.BitmapOf(1))
+				mStore.EXPECT().GetFields().Return(nil)
+				flusher.EXPECT().Close().Return(nil)
+			},
+		},
+		{
+			name: "flush field not persist",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), true)
+				metaDB.EXPECT().GetMetricMeta(gomock.Any()).Return(mStore, true)
+				indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(timeSeriesIndex, true)
+				timeSeriesIndex.EXPECT().GetTimeRange(gomock.Any()).Return(&timeutil.SlotRange{}, true)
+				timeSeriesIndex.EXPECT().MemTimeSeriesIDs().Return(roaring.BitmapOf(1))
+				mStore.EXPECT().GetFields().Return(field.Metas{{Name: "test", Index: 1}})
+				flusher.EXPECT().Close().Return(nil)
+			},
+		},
+		{
+			name: "flush field data err",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), true)
+				metaDB.EXPECT().GetMetricMeta(gomock.Any()).Return(mStore, true)
+				indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(timeSeriesIndex, true)
+				timeSeriesIndex.EXPECT().GetTimeRange(gomock.Any()).Return(&timeutil.SlotRange{}, true)
+				timeSeriesIndex.EXPECT().MemTimeSeriesIDs().Return(roaring.BitmapOf(1))
+				mStore.EXPECT().GetFields().Return(field.Metas{{Name: "test", Persisted: true, Index: 1}})
+				flusher.EXPECT().PrepareMetric(gomock.Any(), gomock.Any())
+				timeSeriesIndex.EXPECT().FlushMetricsDataTo(gomock.Any(), gomock.Any()).
+					DoAndReturn(func(
+						tableFlusher metricsdata.Flusher,
+						flushFields func(memSeriesID uint32) error,
+					) error {
+						return flushFields(100)
+					})
+				flusher.EXPECT().GetEncoder(gomock.Any()).Return(encoding.NewTSDEncoder(100))
+				buf.EXPECT().GetPage(gomock.Any()).Return(make([]byte, pageSize), true)
+				flusher.EXPECT().FlushField(gomock.Any()).Return(fmt.Errorf("err"))
+			},
+			wantErr: true,
+		},
+		{
+			name: "commit metric data err",
+			prepare: func() {
+				metaDB.EXPECT().GetMetricIDs().Return(roaring.BitmapOf(1))
+				metaDB.EXPECT().GetMemMetricID(gomock.Any()).Return(uint64(0), true)
+				metaDB.EXPECT().GetMetricMeta(gomock.Any()).Return(mStore, true)
+				indexDB.EXPECT().GetTimeSeriesIndex(gomock.Any()).Return(timeSeriesIndex, true)
+				timeSeriesIndex.EXPECT().GetTimeRange(gomock.Any()).Return(&timeutil.SlotRange{}, true)
+				timeSeriesIndex.EXPECT().MemTimeSeriesIDs().Return(roaring.BitmapOf(1))
+				mStore.EXPECT().GetFields().Return(field.Metas{{Name: "test", Persisted: true, Index: 1}})
+				flusher.EXPECT().PrepareMetric(gomock.Any(), gomock.Any())
+				timeSeriesIndex.EXPECT().FlushMetricsDataTo(gomock.Any(), gomock.Any()).Return(nil)
+				flusher.EXPECT().CommitMetric(gomock.Any()).Return(fmt.Errorf("err"))
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.prepare != nil {
+				c.prepare()
+			}
+			err := db.FlushFamilyTo(flusher)
+			if c.wantErr != (err != nil) {
+				t.Fatalf("run %s fail", c.name)
+			}
+		})
+	}
 }
 
 func protoToStorageRow(m *protoMetricsV1.Metric) *metric.StorageRow {
@@ -103,370 +539,12 @@ func protoToStorageRow(m *protoMetricsV1.Metric) *metric.StorageRow {
 	ml.Metrics = append(ml.Metrics, m)
 	var buf bytes.Buffer
 	converter := metric.NewProtoConverter(models.NewDefaultLimits())
-	_, _ = converter.MarshalProtoMetricListV1To(ml, &buf)
+	_, err := converter.MarshalProtoMetricListV1To(ml, &buf)
+	if err != nil {
+		panic(err)
+	}
 
 	var br metric.StorageBatchRows
 	br.UnmarshalRows(buf.Bytes())
-	return &br.Rows()[0]
-}
-
-func TestMemoryDatabase_Write(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer func() {
-		defer ctrl.Finish()
-	}()
-	bufferMgr := NewMockBufferManager(ctrl)
-	cfg := MemoryDatabaseCfg{
-		BufferMgr: bufferMgr,
-	}
-	buf, err := newDataPointBuffer(filepath.Join(t.TempDir(), "db_dir"))
-	assert.NoError(t, err)
-	defer func() {
-		buf.Release()
-		_ = buf.Close()
-	}()
-
-	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(buf, nil).AnyTimes()
-	// mock
-	mockMStore := NewMockmStoreINTF(ctrl)
-	tStore := NewMocktStoreINTF(ctrl)
-	capacity := 0
-	tStore.EXPECT().Capacity().DoAndReturn(func() int {
-		capacity++
-		return capacity
-	}).AnyTimes()
-	fStore := NewMockfStoreINTF(ctrl)
-	fStore.EXPECT().Capacity().DoAndReturn(func() int {
-		capacity++
-		return capacity
-	}).AnyTimes()
-	mockMStore.EXPECT().Capacity().Return(100).AnyTimes()
-	mockMStore.EXPECT().GetOrCreateTStore(uint32(10)).Return(tStore, false).AnyTimes()
-	// build memory-database
-	mdINTF, err := NewMemoryDatabase(cfg)
-	assert.NoError(t, err)
-	md := mdINTF.(*memoryDatabase)
-	assert.Zero(t, md.MemSize())
-
-	// load mock
-	md.mStores.Put(uint32(1), mockMStore)
-	// case 1: write ok
-	gomock.InOrder(
-		tStore.EXPECT().GetFStore(gomock.Any()).Return(fStore, true),
-		fStore.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()),
-		mockMStore.EXPECT().SetSlot(gomock.Any()).Times(1),
-	)
-
-	row := protoToStorageRow(&protoMetricsV1.Metric{
-		Name:      "test1",
-		Namespace: "ns",
-		SimpleFields: []*protoMetricsV1.SimpleField{
-			{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 10},
-		},
-	})
-	row.MetricID = 1
-	row.SeriesID = 10
-	row.SlotIndex = 1
-	row.FieldIDs = []field.ID{10}
-	err = md.WriteRow(row)
-	assert.NoError(t, err)
-	assert.NotZero(t, md.NumOfMetrics())
-
-	// case 2: new metric store
-	row = protoToStorageRow(&protoMetricsV1.Metric{
-		Name:      "test1",
-		Namespace: "ns",
-		SimpleFields: []*protoMetricsV1.SimpleField{
-			{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 10},
-		},
-	})
-	row.MetricID = 20
-	row.SeriesID = 20
-	row.SlotIndex = 1
-	row.FieldIDs = []field.ID{10}
-	err = md.WriteRow(row)
-	assert.NoError(t, err)
-
-	// case 3: create new field store
-	gomock.InOrder(
-		tStore.EXPECT().GetFStore(gomock.Any()).Return(nil, false),
-		tStore.EXPECT().InsertFStore(gomock.Any()),
-		mockMStore.EXPECT().AddField(gomock.Any(), gomock.Any()),
-		mockMStore.EXPECT().SetSlot(gomock.Any()),
-	)
-	row = protoToStorageRow(&protoMetricsV1.Metric{
-		Name:      "test1",
-		Namespace: "ns",
-		SimpleFields: []*protoMetricsV1.SimpleField{
-			{Name: "f4", Type: protoMetricsV1.SimpleFieldType_LAST, Value: 10},
-		},
-	})
-	row.MetricID = 1
-	row.SeriesID = 10
-	row.SlotIndex = 15
-	row.FieldIDs = []field.ID{10}
-	err = md.WriteRow(row)
-	assert.NoError(t, err)
-	assert.True(t, md.MemSize() > 0)
-
-	// case4, write histogram field
-	tStore.EXPECT().GetFStore(gomock.Any()).Return(nil, false).AnyTimes()
-	tStore.EXPECT().InsertFStore(gomock.Any()).AnyTimes()
-	mockMStore.EXPECT().AddField(gomock.Any(), gomock.Any()).AnyTimes()
-	mockMStore.EXPECT().SetSlot(gomock.Any()).AnyTimes()
-	releaseLock := md.WithLock()
-
-	row = protoToStorageRow(&protoMetricsV1.Metric{
-		Name:      "test1",
-		Namespace: "ns",
-		SimpleFields: []*protoMetricsV1.SimpleField{
-			{Name: "f4", Type: protoMetricsV1.SimpleFieldType_LAST, Value: 10},
-		},
-		CompoundField: &protoMetricsV1.CompoundField{
-			Min:            10,
-			Max:            10,
-			Sum:            10,
-			Count:          10,
-			ExplicitBounds: []float64{1, 1, 1, 1, 1, math.Inf(1) + 1},
-			Values:         []float64{1, 1, 1, 1, 1, 1},
-		},
-	})
-	row.MetricID = 1
-	row.SeriesID = 10
-	row.SlotIndex = 15
-	row.FieldIDs = []field.ID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
-	releaseLock()
-	err = md.WriteRow(row)
-	assert.NoError(t, err)
-	assert.NotZero(t, md.NumOfSeries())
-	err = md.Close()
-	assert.NoError(t, err)
-}
-
-func TestMemoryDatabase_Write_err(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer func() {
-		defer ctrl.Finish()
-	}()
-	bufferMgr := NewMockBufferManager(ctrl)
-	cfg := MemoryDatabaseCfg{
-		BufferMgr: bufferMgr,
-	}
-
-	// mock
-	mockMStore := NewMockmStoreINTF(ctrl)
-	mockMStore.EXPECT().Capacity().Return(100).AnyTimes()
-	tStore := NewMocktStoreINTF(ctrl)
-	tStore.EXPECT().Capacity().Return(100).AnyTimes()
-	mockMStore.EXPECT().GetOrCreateTStore(uint32(10)).Return(tStore, false).AnyTimes()
-	buf := NewMockDataPointBuffer(ctrl)
-	buf.EXPECT().AllocPage().Return(nil, fmt.Errorf("err"))
-	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(buf, nil).AnyTimes()
-	// build memory-database
-	mdINTF, err := NewMemoryDatabase(cfg)
-	assert.NoError(t, err)
-	md := mdINTF.(*memoryDatabase)
-
-	// load mock
-	md.mStores.Put(uint32(1), mockMStore)
-	// case 1: write ok
-	tStore.EXPECT().GetFStore(gomock.Any()).Return(nil, false)
-
-	row := protoToStorageRow(&protoMetricsV1.Metric{
-		Name:      "test1",
-		Namespace: "ns",
-		SimpleFields: []*protoMetricsV1.SimpleField{
-			{Name: "f4", Type: protoMetricsV1.SimpleFieldType_LAST, Value: 10},
-		},
-	})
-	row.MetricID = 1
-	row.SeriesID = 10
-	row.SlotIndex = 15
-	row.FieldIDs = []field.ID{10}
-
-	err = md.WriteRow(row)
-	assert.Error(t, err)
-
-	buf.EXPECT().Release()
-	err = md.Close()
-	assert.NoError(t, err)
-}
-
-func TestMemoryDatabase_WriteHistogram_Err(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer func() {
-		defer ctrl.Finish()
-	}()
-	bufferMgr := NewMockBufferManager(ctrl)
-	cfg := MemoryDatabaseCfg{
-		BufferMgr: bufferMgr,
-	}
-	buf := NewMockDataPointBuffer(ctrl)
-	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(buf, nil).AnyTimes()
-
-	// mock
-	fStore := NewMockfStoreINTF(ctrl)
-	fStore.EXPECT().Capacity().Return(100).AnyTimes()
-	fStore.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-	mockMStore := NewMockmStoreINTF(ctrl)
-	mockMStore.EXPECT().Capacity().Return(100).AnyTimes()
-	tStore := NewMocktStoreINTF(ctrl)
-	tStore.EXPECT().Capacity().Return(100).AnyTimes()
-	mockMStore.EXPECT().GetOrCreateTStore(uint32(10)).Return(tStore, true).AnyTimes()
-	// build memory-database
-	mdINTF, err := NewMemoryDatabase(cfg)
-	assert.NoError(t, err)
-	md := mdINTF.(*memoryDatabase)
-	md.mStores.Put(uint32(1), mockMStore)
-
-	row := protoToStorageRow(&protoMetricsV1.Metric{
-		Name:      "test1",
-		Namespace: "ns",
-		CompoundField: &protoMetricsV1.CompoundField{
-			Min:            10,
-			Max:            10,
-			Sum:            10,
-			Count:          10,
-			ExplicitBounds: []float64{1, 1, 1, 1, 1, math.Inf(1) + 1},
-			Values:         []float64{1, 1, 1, 1, 1, 1},
-		},
-	})
-	row.MetricID = 1
-	row.SeriesID = 10
-	row.SlotIndex = 15
-	row.FieldIDs = []field.ID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-
-	// write min failure
-	tStore.EXPECT().GetFStore(field.ID(1)).Return(nil, false)
-	buf.EXPECT().AllocPage().Return(nil, fmt.Errorf("err"))
-	err = md.WriteRow(row)
-	assert.Error(t, err)
-	// write max failure
-	tStore.EXPECT().GetFStore(field.ID(1)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(2)).Return(nil, false)
-	buf.EXPECT().AllocPage().Return(nil, fmt.Errorf("err"))
-	err = md.WriteRow(row)
-	assert.Error(t, err)
-	// write sum failure
-	tStore.EXPECT().GetFStore(field.ID(1)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(2)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(3)).Return(nil, false)
-	buf.EXPECT().AllocPage().Return(nil, fmt.Errorf("err"))
-	err = md.WriteRow(row)
-	assert.Error(t, err)
-	// write count failure
-	tStore.EXPECT().GetFStore(field.ID(1)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(2)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(3)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(4)).Return(nil, false)
-	buf.EXPECT().AllocPage().Return(nil, fmt.Errorf("err"))
-	err = md.WriteRow(row)
-	assert.Error(t, err)
-	// write bucket failure
-	tStore.EXPECT().GetFStore(field.ID(1)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(2)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(3)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(field.ID(4)).Return(fStore, true)
-	tStore.EXPECT().GetFStore(gomock.Any()).Return(nil, false)
-	buf.EXPECT().AllocPage().Return(nil, fmt.Errorf("err"))
-	err = md.WriteRow(row)
-	assert.Error(t, err)
-}
-
-func TestMemoryDatabase_FlushFamilyTo(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	bufferMgr := NewMockBufferManager(ctrl)
-	cfg := MemoryDatabaseCfg{
-		BufferMgr: bufferMgr,
-	}
-	buf, err := newDataPointBuffer(filepath.Join(t.TempDir(), "db_dir"))
-	assert.NoError(t, err)
-
-	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(buf, nil).AnyTimes()
-	mdINTF, err := NewMemoryDatabase(cfg)
-	assert.NoError(t, err)
-	md := mdINTF.(*memoryDatabase)
-	flusher := metricsdata.NewMockFlusher(ctrl)
-	flusher.EXPECT().CommitMetric(gomock.Any()).Return(nil).AnyTimes()
-	flusher.EXPECT().Close().Return(nil).AnyTimes()
-	// mock mStore
-	mockMStore := NewMockmStoreINTF(ctrl)
-	md.mStores.Put(uint32(3333), mockMStore)
-
-	// case 1: flusher ok
-	mockMStore.EXPECT().FlushMetricsDataTo(gomock.Any(), gomock.Any()).Return(nil)
-	err = md.FlushFamilyTo(flusher)
-	assert.NoError(t, err)
-	// case 2: flusher err
-	mockMStore.EXPECT().FlushMetricsDataTo(gomock.Any(), gomock.Any()).Return(fmt.Errorf("err"))
-	err = md.FlushFamilyTo(flusher)
-	assert.Error(t, err)
-
-	err = md.Close()
-	assert.NoError(t, err)
-}
-
-func TestMemoryDatabase_Filter(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	bufferMgr := NewMockBufferManager(ctrl)
-	now := timeutil.Now()
-	cfg := MemoryDatabaseCfg{
-		BufferMgr:  bufferMgr,
-		FamilyTime: now,
-	}
-	buf, err := newDataPointBuffer(filepath.Join(t.TempDir(), "db_dir"))
-	assert.NoError(t, err)
-
-	bufferMgr.EXPECT().AllocBuffer(gomock.Any()).Return(buf, nil).AnyTimes()
-	mdINTF, err := NewMemoryDatabase(cfg)
-	assert.NoError(t, err)
-	md := mdINTF.(*memoryDatabase)
-
-	// case 1: family not found
-	rs, err := md.Filter(&flow.ShardExecuteContext{
-		StorageExecuteCtx: &flow.StorageExecuteContext{
-			MetricID: metric.ID(3333),
-			Query: &stmtpkg.Query{
-				StorageInterval: timeutil.Interval(timeutil.OneMinute),
-				TimeRange:       timeutil.TimeRange{},
-			},
-			Fields: field.Metas{{ID: 1}},
-		},
-	})
-	assert.NoError(t, err)
-	assert.Nil(t, rs)
-	// case 2: metric store not found
-	ctx := &flow.ShardExecuteContext{
-		StorageExecuteCtx: &flow.StorageExecuteContext{
-			MetricID: metric.ID(3333),
-			Query: &stmtpkg.Query{
-				StorageInterval: timeutil.Interval(timeutil.OneMinute),
-				TimeRange:       timeutil.TimeRange{Start: now - 10, End: now + 20},
-			},
-			Fields: field.Metas{{ID: 1}},
-		},
-	}
-	rs, err = md.Filter(ctx)
-	assert.NoError(t, err)
-	assert.Nil(t, rs)
-	// case 3: filter success
-	// mock mStore
-	mockMStore := NewMockmStoreINTF(ctrl)
-	mockMStore.EXPECT().Filter(gomock.Any(), gomock.Any()).Return([]flow.FilterResultSet{}, nil)
-	md.mStores.Put(uint32(3333), mockMStore)
-	mockMStore.EXPECT().GetSlotRange().Return(&timeutil.SlotRange{Start: 0, End: 60})
-	rs, err = md.Filter(ctx)
-	assert.NoError(t, err)
-	assert.NotNil(t, rs)
-
-	// case 4: slot range not match
-	mockMStore.EXPECT().GetSlotRange().Return(&timeutil.SlotRange{Start: 600, End: 600})
-	rs, err = md.Filter(ctx)
-	assert.NoError(t, err)
-	assert.Nil(t, rs)
-
-	err = md.Close()
-	assert.NoError(t, err)
+	return br.Rows()[0]
 }

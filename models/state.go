@@ -23,10 +23,11 @@ import (
 	"time"
 
 	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/lindb/common/models"
+	"github.com/lindb/common/pkg/encoding"
+	"github.com/lindb/common/pkg/timeutil"
 
 	"github.com/lindb/lindb/config"
-	"github.com/lindb/lindb/pkg/encoding"
-	"github.com/lindb/lindb/pkg/timeutil"
 )
 
 type ShardStateType int
@@ -105,7 +106,7 @@ func (s Brokers) ToTable() (rows int, tableStr string) {
 	if len(s) == 0 {
 		return 0, ""
 	}
-	writer := NewTableFormatter()
+	writer := models.NewTableFormatter()
 	writer.AppendHeader(table.Row{"Namespace", "Status", "Configuration"})
 	for i := range s {
 		r := s[i]
@@ -126,7 +127,7 @@ func (s Storages) ToTable() (rows int, tableStr string) {
 	if len(s) == 0 {
 		return 0, ""
 	}
-	writer := NewTableFormatter()
+	writer := models.NewTableFormatter()
 	writer.AppendHeader(table.Row{"Namespace", "Status", "Configuration"})
 	for i := range s {
 		r := s[i]
@@ -167,10 +168,10 @@ func (r ReplicaState) String() string {
 
 // ShardState represents current state of shard.
 type ShardState struct {
+	Replica Replica        `json:"replica"`
 	ID      ShardID        `json:"id"`
 	State   ShardStateType `json:"state"`
 	Leader  NodeID         `json:"leader"`
-	Replica Replica        `json:"replica"`
 }
 
 // FamilyState represents current state of shard's family.
@@ -183,9 +184,8 @@ type FamilyState struct {
 // BrokerState represents broker cluster state.
 // NOTICE: it is not safe for concurrent use.
 type BrokerState struct {
-	Name string `json:"name"` // ref Namespace
-
 	LiveNodes map[string]StatelessNode `json:"liveNodes"`
+	Name      string                   `json:"name"`
 }
 
 func NewBrokerState(name string) *BrokerState {
@@ -217,19 +217,16 @@ func (b *BrokerState) NodeOffline(nodeID string) {
 // NOTICE: it is not safe for concurrent use.
 // TODO: need concurrent safe????
 type StorageState struct {
-	Name string `json:"name"` // ref Namespace
-
 	LiveNodes map[NodeID]StatefulNode `json:"liveNodes"`
 
-	// TODO remove??
+	// TODO: remove??
 	ShardAssignments map[string]*ShardAssignment       `json:"shardAssignments"` // database's name => shard assignment
 	ShardStates      map[string]map[ShardID]ShardState `json:"shardStates"`      // database's name => shard state
 }
 
 // NewStorageState creates storage cluster state
-func NewStorageState(name string) *StorageState {
+func NewStorageState() *StorageState {
 	return &StorageState{
-		Name:             name,
 		LiveNodes:        make(map[NodeID]StatefulNode),
 		ShardAssignments: make(map[string]*ShardAssignment),
 		ShardStates:      make(map[string]map[ShardID]ShardState),
@@ -286,8 +283,8 @@ func (s *StorageState) String() string {
 
 // StateMachineInfo represents state machine register info.
 type StateMachineInfo struct {
-	Path        string             `json:"path"`
 	CreateState func() interface{} `json:"-"`
+	Path        string             `json:"path"`
 }
 
 // StateMetric represents internal state metric.
@@ -305,18 +302,17 @@ type StateField struct {
 
 // DataFamilyState represents the state of data family.
 type DataFamilyState struct {
-	ShardID          ShardID               `json:"shardId"`
-	FamilyTime       string                `json:"familyTime"`
 	AckSequences     map[int32]int64       `json:"ackSequences"`
 	ReplicaSequences map[int32]int64       `json:"replicaSequences"`
+	FamilyTime       string                `json:"familyTime"`
 	MemoryDatabases  []MemoryDatabaseState `json:"memoryDatabases"`
+	ShardID          ShardID               `json:"shardId"`
 }
 
 // MemoryDatabaseState represents the state of memory database.
 type MemoryDatabaseState struct {
-	State        string        `json:"state"`
-	Uptime       time.Duration `json:"uptime"`
-	MemSize      int64         `json:"memSize"`
-	NumOfMetrics int           `json:"numOfMetrics"`
-	NumOfSeries  int           `json:"numOfSeries"`
+	State       string        `json:"state"`
+	Uptime      time.Duration `json:"uptime"`
+	MemSize     int64         `json:"memSize"`
+	NumOfSeries int           `json:"numOfSeries"`
 }

@@ -24,9 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"go.uber.org/atomic"
-
 	"github.com/lindb/roaring"
+	"go.uber.org/atomic"
 
 	"github.com/lindb/lindb/aggregation"
 	"github.com/lindb/lindb/models"
@@ -71,14 +70,12 @@ type StorageExecuteContext struct {
 
 	// set value in plan stage when lookup table.
 	MetricID metric.ID
+	Schema   *metric.Schema // FIXME: need check empty
 
 	// set value in plan stage when lookup select fields.
 	Fields            field.Metas
 	DownSamplingSpecs aggregation.AggregatorSpecs
 	AggregatorSpecs   aggregation.AggregatorSpecs
-
-	// TagKeys cache all tag keys metadata for current query session
-	TagKeys map[string]tag.KeyID // for cache tag key
 
 	// result which after tag condition metadata filter
 	// set value in tag search, the where clause condition that user input
@@ -272,10 +269,7 @@ func (agg *GroupingSeriesAgg) reduce(reduceFn func(it series.GroupedIterator)) {
 
 // DataLoadContext represents data load level query execute context.
 type DataLoadContext struct {
-	ShardExecuteCtx          *ShardExecuteContext
-	IsMultiField, IsGrouping bool
-
-	MinSeriesID, MaxSeriesID uint16
+	ShardExecuteCtx *ShardExecuteContext
 	// range of min/max low series id
 	// if no grouping value is low series ids
 	// if grouping value is index of GroupingSeriesAgg
@@ -287,6 +281,9 @@ type DataLoadContext struct {
 	WithoutGroupingSeriesAgg *GroupingSeriesAgg
 	GroupingSeriesAgg        []*GroupingSeriesAgg
 	groupingSeriesAggRefIdx  uint16
+
+	IsMultiField, IsGrouping bool
+	MinSeriesID, MaxSeriesID uint16
 
 	Decoder      *encoding.TSDDecoder
 	DownSampling func(slotRange timeutil.SlotRange, seriesIdx uint16, fieldIdx int, getter encoding.TSDValueGetter)

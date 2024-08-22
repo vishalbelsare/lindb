@@ -25,7 +25,8 @@ import (
 
 	"github.com/jedib0t/go-pretty/v6/table"
 
-	"github.com/lindb/lindb/pkg/timeutil"
+	"github.com/lindb/common/models"
+	"github.com/lindb/common/pkg/timeutil"
 )
 
 // NodeID represents node identifier.
@@ -49,6 +50,8 @@ type Node interface {
 	Indicator() string
 	// HTTPAddress returns address for http.
 	HTTPAddress() string
+	// Online sets node's online time.
+	Online()
 }
 
 // StatefulNode represents stateful node basic info.
@@ -66,26 +69,26 @@ func (n StatelessNodes) ToTable() (rows int, tableStr string) {
 	if len(n) == 0 {
 		return 0, ""
 	}
-	writer := NewTableFormatter()
+	writer := models.NewTableFormatter()
 	writer.AppendHeader(table.Row{"Online time", "Host IP", "Host Name", "Port(HTTP/GRPC)", "Version"})
 	for i := range n {
 		r := n[i]
 		writer.AppendRow(table.Row{
 			timeutil.FormatTimestamp(r.OnlineTime, timeutil.DataTimeFormat2),
-			r.HostIP, r.HostName, fmt.Sprintf("%d/%d", r.HTTPPort, r.GRPCPort), r.Version})
+			r.HostIP, r.HostName, fmt.Sprintf("%d/%d", r.HTTPPort, r.GRPCPort), r.Version,
+		})
 	}
 	return len(n), writer.Render()
 }
 
 // StatelessNode represents stateless node basic info.
 type StatelessNode struct {
-	HostIP   string `json:"hostIp"`
-	HostName string `json:"hostName"`
-	GRPCPort uint16 `json:"grpcPort,omitempty"`
-	HTTPPort uint16 `json:"httpPort"`
-
+	HostIP     string `json:"hostIp"`
+	HostName   string `json:"hostName"`
 	Version    string `json:"version"`
-	OnlineTime int64  `json:"onlineTime"` // node online time(millisecond)
+	OnlineTime int64  `json:"onlineTime"`
+	GRPCPort   uint16 `json:"grpcPort,omitempty"`
+	HTTPPort   uint16 `json:"httpPort"`
 }
 
 // Indicator returns node indicator's string.
@@ -98,6 +101,10 @@ func (n *StatelessNode) Indicator() string {
 
 func (n *StatelessNode) HTTPAddress() string {
 	return fmt.Sprintf("http://%s:%d", n.HostIP, n.HTTPPort)
+}
+
+func (n *StatelessNode) Online() {
+	n.OnlineTime = timeutil.Now()
 }
 
 // ParseNode parses Node from indicator,
@@ -118,7 +125,7 @@ func ParseNode(indicator string) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	//TODO: change base node info???
+	// TODO: change base node info???
 	return &StatelessNode{
 		HostIP:   indicator[:index],
 		GRPCPort: uint16(port),
@@ -133,7 +140,7 @@ type Master struct {
 
 // ToTable returns master info as table.
 func (m *Master) ToTable() (rows int, tableStr string) {
-	writer := NewTableFormatter()
+	writer := models.NewTableFormatter()
 	writer.AppendHeader(table.Row{"Desc", "Value"})
 	writer.AppendRow(table.Row{"Elect Time", timeutil.FormatTimestamp(m.ElectTime, timeutil.DataTimeFormat2)})
 	writer.AppendRow(table.Row{"Online Time", timeutil.FormatTimestamp(m.Node.OnlineTime, timeutil.DataTimeFormat2)})

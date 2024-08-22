@@ -22,13 +22,13 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/lindb/common/pkg/fileutil"
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/timeutil"
 	"go.uber.org/atomic"
 
 	"github.com/lindb/lindb/kv/table"
 	"github.com/lindb/lindb/kv/version"
-	"github.com/lindb/lindb/pkg/fileutil"
-	"github.com/lindb/lindb/pkg/logger"
-	"github.com/lindb/lindb/pkg/timeutil"
 )
 
 //go:generate mockgen -source ./family.go -destination=./family_mock.go -package kv
@@ -88,22 +88,19 @@ type Family interface {
 
 // family implements Family interface
 type family struct {
-	store         Store
-	name          string
-	familyPath    string
-	option        FamilyOption
-	merger        NewMerger
-	familyVersion version.FamilyVersion
-	maxFileSize   uint32
-
-	pendingOutputs    sync.Map // keep all pending output files, includes flush/compact/rollup.
+	familyVersion     version.FamilyVersion
+	store             Store
+	lastRollupTime    *atomic.Int64
+	merger            NewMerger
 	newCompactJobFunc func(family Family, state *compactionState, rollup Rollup) CompactJob
-
-	rolluping      atomic.Bool
-	lastRollupTime *atomic.Int64
-	compacting     atomic.Bool
-
-	condition sync.WaitGroup // compact/rollup job if it's doing
+	pendingOutputs    sync.Map
+	name              string
+	familyPath        string
+	option            FamilyOption
+	condition         sync.WaitGroup
+	rolluping         atomic.Bool
+	compacting        atomic.Bool
+	maxFileSize       uint32
 }
 
 // newFamily creates new family or open existed family.
@@ -119,7 +116,7 @@ func newFamily(store Store, option FamilyOption) (Family, error) {
 	}
 	merger, ok := mergers[MergerType(option.Merger)]
 	if !ok {
-		return nil, fmt.Errorf("merger of option not impelement Merger interface, merger is [%s]", option.Merger)
+		return nil, fmt.Errorf("merger of option not impelement Merger interface, merger is [%s], family [%s]", option.Merger, familyPath)
 	}
 	maxFileSize := defaultMaxFileSize
 	if option.MaxFileSize > 0 {
@@ -238,7 +235,7 @@ func (f *family) needCompact() bool {
 
 // compact does compact job if it hasn't compact job running.
 func (f *family) compact() {
-	if f.compacting.CAS(false, true) {
+	if f.compacting.CompareAndSwap(false, true) {
 		f.condition.Add(1)
 		go func() {
 			defer func() {

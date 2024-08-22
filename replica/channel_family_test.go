@@ -25,17 +25,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
+	"github.com/lindb/common/pkg/logger"
+	"github.com/lindb/common/pkg/timeutil"
+	protoMetricsV1 "github.com/lindb/common/proto/gen/v1/linmetrics"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/atomic"
-
-	protoMetricsV1 "github.com/lindb/common/proto/gen/v1/linmetrics"
+	"go.uber.org/mock/gomock"
 
 	"github.com/lindb/lindb/config"
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/logger"
-	"github.com/lindb/lindb/pkg/timeutil"
 	"github.com/lindb/lindb/rpc"
 	"github.com/lindb/lindb/series/metric"
 )
@@ -69,13 +68,14 @@ func TestFamilyChannel_Write(t *testing.T) {
 		Name:      "cpu",
 		Timestamp: timeutil.Now(),
 		SimpleFields: []*protoMetricsV1.SimpleField{
-			{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 1}},
+			{Name: "f1", Type: protoMetricsV1.SimpleFieldType_DELTA_SUM, Value: 1},
+		},
 	}, &brokerRow))
 
 	cases := []struct {
+		prepare func()
 		name    string
 		rows    []metric.BrokerRow
-		prepare func()
 		wantErr bool
 	}{
 		{
@@ -137,6 +137,7 @@ func TestFamilyChannel_leaderChanged(t *testing.T) {
 	shard := models.ShardState{ID: 1}
 	liveNodes := make(map[models.NodeID]models.StatefulNode)
 	fc := &familyChannel{
+		notifyLeaderChange:  atomic.NewBool(false),
 		leaderChangedSignal: make(chan struct{}, 1),
 		statistics:          metrics.NewBrokerFamilyWriteStatistics("db"),
 	}
@@ -163,7 +164,7 @@ func TestChannel_checkFlush(t *testing.T) {
 		lastFlushTime:  atomic.NewInt64(timeutil.Now()),
 		stoppingSignal: make(chan struct{}, 1),
 		stoppedSignal:  make(chan struct{}, 1),
-		ch:             make(chan *compressedChunk),
+		ch:             make(chan []byte),
 		statistics:     metrics.NewBrokerFamilyWriteStatistics("test"),
 		logger:         logger.GetLogger("Replica", "Test"),
 	}
@@ -185,7 +186,7 @@ func TestFamilyChannel_flushChunkOnFull(t *testing.T) {
 
 	chunk := NewMockChunk(ctrl)
 	chunk.EXPECT().IsFull().Return(true).AnyTimes()
-	chunk.EXPECT().Compress().Return(&compressedChunk{1, 2, 3}, nil).AnyTimes()
+	chunk.EXPECT().Compress().Return([]byte{1, 2, 3}, nil).AnyTimes()
 	ctx, cancel := context.WithCancel(context.TODO())
 	f := &familyChannel{
 		cancel:        cancel,
@@ -193,7 +194,7 @@ func TestFamilyChannel_flushChunkOnFull(t *testing.T) {
 		chunk:         chunk,
 		batchTimeout:  5 * time.Second,
 		lastFlushTime: atomic.NewInt64(timeutil.Now()),
-		ch:            make(chan *compressedChunk, 1),
+		ch:            make(chan []byte, 1),
 		statistics:    metrics.NewBrokerFamilyWriteStatistics("db"),
 		logger:        logger.GetLogger("Replica", "Test"),
 	}
@@ -211,7 +212,7 @@ func TestFamilyChannel_isExpire(t *testing.T) {
 		ctx:            ctx,
 		cancel:         cancel,
 		familyTime:     1,
-		ch:             make(chan *compressedChunk),
+		ch:             make(chan []byte),
 		stoppingSignal: make(chan struct{}, 1),
 		statistics:     metrics.NewBrokerFamilyWriteStatistics("db"),
 		lastFlushTime:  atomic.NewInt64(timeutil.Now()),
@@ -240,7 +241,7 @@ func TestFamilyChannel_flushChunk(t *testing.T) {
 		cancel:     cancel,
 		ctx:        ctx,
 		chunk:      chunk,
-		ch:         make(chan *compressedChunk, 1),
+		ch:         make(chan []byte, 1),
 		statistics: metrics.NewBrokerFamilyWriteStatistics("db"),
 		logger:     logger.GetLogger("Replica", "Test"),
 	}
@@ -251,11 +252,11 @@ func TestFamilyChannel_flushChunk(t *testing.T) {
 	chunk.EXPECT().Compress().Return(nil, nil)
 	f.flushChunk()
 	// flush data
-	chunk.EXPECT().Compress().Return(&compressedChunk{1, 2, 3}, nil)
+	chunk.EXPECT().Compress().Return([]byte{1, 2, 3}, nil)
 	f.flushChunk()
 
 	cancel()
-	chunk.EXPECT().Compress().Return(&compressedChunk{1, 2, 3}, nil)
+	chunk.EXPECT().Compress().Return([]byte{1, 2, 3}, nil)
 	// family is stopped
 	f.flushChunk()
 }
@@ -267,8 +268,8 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 	}()
 
 	cases := []struct {
-		name    string
 		prepare func(f *familyChannel)
+		name    string
 	}{
 		{
 			name: "stop family, no data need flush",
@@ -311,7 +312,7 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				chunk := NewMockChunk(ctrl)
 				f.chunk = chunk
 				chunk.EXPECT().IsEmpty().Return(false)
-				chunk.EXPECT().Compress().Return(&compressedChunk{}, nil)
+				chunk.EXPECT().Compress().Return([]byte{}, nil)
 				go func() {
 					f.Stop(10)
 				}()
@@ -323,10 +324,11 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				chunk := NewMockChunk(ctrl)
 				f.chunk = chunk
 				chunk.EXPECT().IsEmpty().Return(false)
-				chunk.EXPECT().Compress().Return(&compressedChunk{1, 2, 3}, nil)
+				chunk.EXPECT().Compress().Return([]byte{1, 2, 3}, nil)
 				f.newWriteStreamFn = func(ctx context.Context, target models.Node,
 					database string, shardState *models.ShardState, familyTime int64,
-					fct rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					fct rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					return nil, fmt.Errorf("err")
 				}
 				go func() {
@@ -340,11 +342,12 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				chunk := NewMockChunk(ctrl)
 				f.chunk = chunk
 				chunk.EXPECT().IsEmpty().Return(false)
-				chunk.EXPECT().Compress().Return(&compressedChunk{1, 2, 3}, nil)
+				chunk.EXPECT().Compress().Return([]byte{1, 2, 3}, nil)
 				stream := rpc.NewMockWriteStream(ctrl)
 				f.newWriteStreamFn = func(ctx context.Context, target models.Node,
 					database string, shardState *models.ShardState, familyTime int64,
-					fct rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					fct rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					return stream, nil
 				}
 				stream.EXPECT().Close()
@@ -360,11 +363,12 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				chunk := NewMockChunk(ctrl)
 				f.chunk = chunk
 				chunk.EXPECT().IsEmpty().Return(false)
-				chunk.EXPECT().Compress().Return(&compressedChunk{1, 2, 3}, nil)
+				chunk.EXPECT().Compress().Return([]byte{1, 2, 3}, nil)
 				stream := rpc.NewMockWriteStream(ctrl)
 				f.newWriteStreamFn = func(ctx context.Context, target models.Node,
 					database string, shardState *models.ShardState, familyTime int64,
-					fct rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					fct rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					return stream, nil
 				}
 				stream.EXPECT().Close().Return(nil)
@@ -380,11 +384,12 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				chunk := NewMockChunk(ctrl)
 				f.chunk = chunk
 				chunk.EXPECT().IsEmpty().Return(false)
-				chunk.EXPECT().Compress().Return(&compressedChunk{1, 2, 3}, nil)
+				chunk.EXPECT().Compress().Return([]byte{1, 2, 3}, nil)
 				stream := rpc.NewMockWriteStream(ctrl)
 				f.newWriteStreamFn = func(ctx context.Context, target models.Node,
 					database string, shardState *models.ShardState, familyTime int64,
-					fct rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					fct rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					return stream, nil
 				}
 				stream.EXPECT().Close().Return(fmt.Errorf("err"))
@@ -400,11 +405,12 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				chunk := NewMockChunk(ctrl)
 				f.chunk = chunk
 				chunk.EXPECT().IsEmpty().Return(false)
-				chunk.EXPECT().Compress().Return(&compressedChunk{1, 2, 3}, nil)
+				chunk.EXPECT().Compress().Return([]byte{1, 2, 3}, nil)
 				stream := rpc.NewMockWriteStream(ctrl)
 				f.newWriteStreamFn = func(ctx context.Context, target models.Node,
 					database string, shardState *models.ShardState, familyTime int64,
-					fct rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					fct rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					return stream, nil
 				}
 				stream.EXPECT().Close().Return(fmt.Errorf("err"))
@@ -423,16 +429,17 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				lastCh := make(chan struct{})
 				f.newWriteStreamFn = func(_ context.Context, _ models.Node,
 					_ string, _ *models.ShardState, _ int64,
-					_ rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					_ rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					time.Sleep(100 * time.Millisecond)
 					return nil, fmt.Errorf("err")
 				}
 				// put chunk frist
-				f.ch <- &compressedChunk{1, 2, 3}
+				f.ch <- []byte{1, 2, 3}
 				go func() {
 					f.cancel()
 					go func() {
-						f.ch <- &compressedChunk{1, 2, 3}
+						f.ch <- []byte{1, 2, 3}
 						lastCh <- struct{}{}
 					}()
 					<-lastCh
@@ -449,12 +456,13 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				stream := rpc.NewMockWriteStream(ctrl)
 				f.newWriteStreamFn = func(ctx context.Context, target models.Node,
 					database string, shardState *models.ShardState, familyTime int64,
-					fct rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					fct rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					return stream, nil
 				}
 				stream.EXPECT().Send(gomock.Any()).Return(nil)
 				stream.EXPECT().Close().Return(fmt.Errorf("err"))
-				f.ch <- &compressedChunk{1, 2, 3}
+				f.ch <- []byte{1, 2, 3}
 
 				go func() {
 					time.Sleep(200 * time.Millisecond)
@@ -474,13 +482,14 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				stream := rpc.NewMockWriteStream(ctrl)
 				f.newWriteStreamFn = func(ctx context.Context, target models.Node,
 					database string, shardState *models.ShardState, familyTime int64,
-					fct rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					fct rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					return stream, nil
 				}
 				stream.EXPECT().Send(gomock.Any()).Return(fmt.Errorf("err")).AnyTimes()
 				stream.EXPECT().Close().Return(nil).AnyTimes()
-				f.ch <- &compressedChunk{1, 2, 3}
-				f.ch <- &compressedChunk{1, 2, 3}
+				f.ch <- []byte{1, 2, 3}
+				f.ch <- []byte{1, 2, 3}
 
 				go func() {
 					time.Sleep(200 * time.Millisecond)
@@ -498,15 +507,16 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 				stream := rpc.NewMockWriteStream(ctrl)
 				f.newWriteStreamFn = func(ctx context.Context, target models.Node,
 					database string, shardState *models.ShardState, familyTime int64,
-					fct rpc.ClientStreamFactory) (rpc.WriteStream, error) {
+					fct rpc.ClientStreamFactory,
+				) (rpc.WriteStream, error) {
 					return stream, nil
 				}
 				stream.EXPECT().Send(gomock.Any()).Return(fmt.Errorf("err"))
 				stream.EXPECT().Send(gomock.Any()).Return(nil)
 				stream.EXPECT().Send(gomock.Any()).Return(fmt.Errorf("err")).AnyTimes()
 				stream.EXPECT().Close().Return(nil).AnyTimes()
-				f.ch <- &compressedChunk{1, 2, 3}
-				f.ch <- &compressedChunk{1, 2, 3}
+				f.ch <- []byte{1, 2, 3}
+				f.ch <- []byte{1, 2, 3}
 
 				go func() {
 					time.Sleep(200 * time.Millisecond)
@@ -523,7 +533,8 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 			f := &familyChannel{
 				cancel:              cancel,
 				ctx:                 ctx,
-				ch:                  make(chan *compressedChunk, 2),
+				ch:                  make(chan []byte, 2),
+				notifyLeaderChange:  atomic.NewBool(false),
 				maxRetryBuf:         1,
 				checkFlushInterval:  time.Millisecond * 100,
 				lastFlushTime:       atomic.NewInt64(timeutil.Now()),
@@ -548,14 +559,14 @@ func TestFamilyChannel_writeTask(t *testing.T) {
 
 func TestFamilyChannel_sendingLastMessage(t *testing.T) {
 	f := &familyChannel{
-		ch:     make(chan *compressedChunk, 2),
+		ch:     make(chan []byte, 2),
 		logger: logger.GetLogger("Replica", "Test"),
 	}
-	f.ch <- &compressedChunk{}
+	f.ch <- []byte{}
 	var wait sync.WaitGroup
 	wait.Add(1)
 	go func() {
-		f.sendPendingMessage(func(_ *compressedChunk) {
+		f.sendPendingMessage(func(_ []byte) {
 		})
 		wait.Done()
 	}()

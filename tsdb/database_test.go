@@ -18,24 +18,24 @@
 package tsdb
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
+	"github.com/lindb/common/pkg/fileutil"
+	"github.com/lindb/common/pkg/ltoml"
+	commontimeutil "github.com/lindb/common/pkg/timeutil"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/atomic"
+	"go.uber.org/mock/gomock"
 
+	"github.com/lindb/lindb/index"
 	"github.com/lindb/lindb/kv"
 	"github.com/lindb/lindb/metrics"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/fileutil"
-	"github.com/lindb/lindb/pkg/ltoml"
 	"github.com/lindb/lindb/pkg/option"
-	"github.com/lindb/lindb/pkg/timeutil"
-	"github.com/lindb/lindb/tsdb/metadb"
+	"github.com/lindb/lindb/tsdb/memdb"
 )
 
 func TestDatabase_New(t *testing.T) {
@@ -43,22 +43,17 @@ func TestDatabase_New(t *testing.T) {
 	defer func() {
 		encodeToml = ltoml.EncodeToml
 		mkDirIfNotExist = fileutil.MkDirIfNotExist
-		newMetadataFunc = metadb.NewMetadata
-		kv.InitStoreManager(nil)
+		newMetaDBFunc = index.NewMetricMetaDatabase
 		ctrl.Finish()
 	}()
 
-	storeMgr := kv.NewMockStoreManager(ctrl)
-	store := kv.NewMockStore(ctrl)
-	kv.InitStoreManager(storeMgr)
 	opt := &option.DatabaseOption{}
 	shard := NewMockShard(ctrl)
-	shard.EXPECT().notifyLimitsChange().AnyTimes()
 
 	cases := []struct {
-		name    string
 		cfg     *models.DatabaseConfig
 		prepare func()
+		name    string
 		wantErr bool
 	}{
 		{
@@ -80,29 +75,9 @@ func TestDatabase_New(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "create kv store err",
-			prepare: func() {
-				storeMgr.EXPECT().CreateStore(gomock.Any(), gomock.Any()).
-					Return(nil, fmt.Errorf("create store err"))
-			},
-			wantErr: true,
-		},
-		{
-			name: "create kv family err",
-			prepare: func() {
-				storeMgr.EXPECT().CreateStore(gomock.Any(), gomock.Any()).Return(store, nil)
-				store.EXPECT().CreateFamily(gomock.Any(), gomock.Any()).
-					Return(nil, fmt.Errorf("err"))
-			},
-			wantErr: true,
-		},
-		{
 			name: "create metadata err",
 			prepare: func() {
-				storeMgr.EXPECT().CreateStore(gomock.Any(), gomock.Any()).Return(store, nil)
-				store.EXPECT().CreateFamily(gomock.Any(), gomock.Any()).Return(nil, nil)
-				newMetadataFunc = func(ctx context.Context, databaseName, parent string,
-					tagFamily kv.Family) (metadata metadb.Metadata, err error) {
+				newMetaDBFunc = func(_, _ string) (metadata index.MetricMetaDatabase, err error) {
 					return nil, fmt.Errorf("err")
 				}
 			},
@@ -116,8 +91,6 @@ func TestDatabase_New(t *testing.T) {
 		{
 			name: "create shard err",
 			prepare: func() {
-				storeMgr.EXPECT().CreateStore(gomock.Any(), gomock.Any()).Return(store, nil)
-				store.EXPECT().CreateFamily(gomock.Any(), gomock.Any()).Return(nil, nil)
 				newShardFunc = func(db Database, shardID models.ShardID) (s Shard, err error) {
 					return nil, fmt.Errorf("err")
 				}
@@ -127,12 +100,9 @@ func TestDatabase_New(t *testing.T) {
 		{
 			name: "create database successfully",
 			prepare: func() {
-				storeMgr.EXPECT().CreateStore(gomock.Any(), gomock.Any()).Return(store, nil)
-				store.EXPECT().CreateFamily(gomock.Any(), gomock.Any()).Return(nil, nil)
-				metadata := metadb.NewMockMetadata(ctrl)
-				newMetadataFunc = func(ctx context.Context, databaseName, parent string,
-					tagFamily kv.Family) (metadb.Metadata, error) {
-					return metadata, nil
+				metaDB := index.NewMockMetricMetaDatabase(ctrl)
+				newMetaDBFunc = func(_, _ string) (index.MetricMetaDatabase, error) {
+					return metaDB, nil
 				}
 				newShardFunc = func(db Database, shardID models.ShardID) (s Shard, err error) {
 					return shard, nil
@@ -143,17 +113,14 @@ func TestDatabase_New(t *testing.T) {
 		{
 			name: "close metadata err when create database failure",
 			prepare: func() {
-				storeMgr.EXPECT().CreateStore(gomock.Any(), gomock.Any()).Return(store, nil)
-				store.EXPECT().CreateFamily(gomock.Any(), gomock.Any()).Return(nil, nil)
-				metadata := metadb.NewMockMetadata(ctrl)
-				newMetadataFunc = func(ctx context.Context, databaseName, parent string,
-					tagFamily kv.Family) (metadb.Metadata, error) {
-					return metadata, nil
+				metaDB := index.NewMockMetricMetaDatabase(ctrl)
+				newMetaDBFunc = func(_, _ string) (index.MetricMetaDatabase, error) {
+					return metaDB, nil
 				}
 				newShardFunc = func(db Database, shardID models.ShardID) (s Shard, err error) {
 					return nil, fmt.Errorf("err")
 				}
-				metadata.EXPECT().Close().Return(fmt.Errorf("err"))
+				metaDB.EXPECT().Close().Return(fmt.Errorf("err"))
 			},
 			wantErr: true,
 		},
@@ -169,8 +136,7 @@ func TestDatabase_New(t *testing.T) {
 				mkDirIfNotExist = func(path string) error {
 					return nil
 				}
-				newMetadataFunc = func(ctx context.Context, databaseName,
-					parent string, tagFamily kv.Family) (metadb.Metadata, error) {
+				newMetaDBFunc = func(_, _ string) (index.MetricMetaDatabase, error) {
 					return nil, nil
 				}
 				newShardFunc = newShard
@@ -193,13 +159,14 @@ func TestDatabase_New(t *testing.T) {
 
 			if db != nil {
 				// assert database information after create successfully
-				assert.NotNil(t, db.Metadata())
+				assert.NotNil(t, db.MetaDB())
 				assert.NotNil(t, db.ExecutorPool())
 				assert.Equal(t, "db", db.Name())
 				assert.True(t, db.NumOfShards() >= 0)
 				assert.Equal(t, &option.DatabaseOption{Intervals: option.Intervals{{Interval: 10}}}, db.GetOption())
 				assert.NotNil(t, db.GetConfig())
 				assert.NotNil(t, db.GetLimits())
+				assert.NotNil(t, db.MemMetaDB())
 				db.SetLimits(models.NewDefaultLimits())
 			}
 		})
@@ -217,13 +184,13 @@ func TestDatabase_CreateShards(t *testing.T) {
 		shardSet: *newShardSet(),
 	}
 	type args struct {
-		option   option.DatabaseOption
 		shardIDs []models.ShardID
+		option   option.DatabaseOption
 	}
 	cases := []struct {
+		prepare func()
 		name    string
 		args    args
-		prepare func()
 		wantErr bool
 	}{
 		{
@@ -233,7 +200,7 @@ func TestDatabase_CreateShards(t *testing.T) {
 		},
 		{
 			name: "create shard err",
-			args: args{option.DatabaseOption{}, []models.ShardID{4, 5, 6}},
+			args: args{option: option.DatabaseOption{}, shardIDs: []models.ShardID{4, 5, 6}},
 			prepare: func() {
 				newShardFunc = func(db Database, shardID models.ShardID) (s Shard, err error) {
 					return nil, fmt.Errorf("err")
@@ -243,7 +210,7 @@ func TestDatabase_CreateShards(t *testing.T) {
 		},
 		{
 			name: "create exist shard",
-			args: args{option.DatabaseOption{}, []models.ShardID{4}},
+			args: args{option: option.DatabaseOption{}, shardIDs: []models.ShardID{4}},
 			prepare: func() {
 				db.shardSet.InsertShard(models.ShardID(4), nil)
 			},
@@ -251,7 +218,7 @@ func TestDatabase_CreateShards(t *testing.T) {
 		},
 		{
 			name: "create shard successfully",
-			args: args{option.DatabaseOption{}, []models.ShardID{5}},
+			args: args{option: option.DatabaseOption{}, shardIDs: []models.ShardID{5}},
 			prepare: func() {
 				newShardFunc = func(db Database, shardID models.ShardID) (s Shard, err error) {
 					return nil, nil
@@ -261,7 +228,7 @@ func TestDatabase_CreateShards(t *testing.T) {
 		},
 		{
 			name: "dump option err",
-			args: args{option.DatabaseOption{}, []models.ShardID{6}},
+			args: args{option: option.DatabaseOption{}, shardIDs: []models.ShardID{6}},
 			prepare: func() {
 				newShardFunc = func(db Database, shardID models.ShardID) (s Shard, err error) {
 					return nil, nil
@@ -302,41 +269,33 @@ func TestDatabase_CreateShards(t *testing.T) {
 func TestDatabase_Close(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer func() {
-		kv.InitStoreManager(nil)
 		ctrl.Finish()
 	}()
 
-	storeMgr := kv.NewMockStoreManager(ctrl)
-	kv.InitStoreManager(storeMgr)
-	metadata := metadb.NewMockMetadata(ctrl)
-	metadata.EXPECT().Flush().Return(nil).AnyTimes()
+	memMetaDB := memdb.NewMockMetadataDatabase(ctrl)
+	metaDB := index.NewMockMetricMetaDatabase(ctrl)
+	memMetaDB.EXPECT().Notify(gomock.Any()).DoAndReturn(func(event any) {
+		mn := event.(*memdb.FlushEvent)
+		mn.Callback(nil)
+	}).AnyTimes()
 	store := kv.NewMockStore(ctrl)
 	store.EXPECT().Name().Return("metaStore").AnyTimes()
 	db := &database{
-		metadata:       metadata,
+		metaDB:         metaDB,
+		memMetaDB:      memMetaDB,
 		shardSet:       *newShardSet(),
-		metaStore:      store,
 		flushCondition: sync.NewCond(&sync.Mutex{}),
 	}
 	cases := []struct {
-		name    string
 		prepare func()
+		name    string
 		wantErr bool
 	}{
 		{
-			name: "close metadata err",
+			name: "close metadata database err",
 			prepare: func() {
-				metadata.EXPECT().Close().Return(fmt.Errorf("err"))
-			},
-			wantErr: true,
-		},
-		{
-			name: "close meta store err",
-			prepare: func() {
-				gomock.InOrder(
-					metadata.EXPECT().Close().Return(nil),
-					storeMgr.EXPECT().CloseStore("metaStore").Return(fmt.Errorf("err")),
-				)
+				memMetaDB.EXPECT().Close()
+				metaDB.EXPECT().Close().Return(fmt.Errorf("err"))
 			},
 			wantErr: true,
 		},
@@ -344,10 +303,11 @@ func TestDatabase_Close(t *testing.T) {
 			name: "close meta store err",
 			prepare: func() {
 				mockShard := NewMockShard(ctrl)
+				mockShard.EXPECT().FlushIndex().Return(fmt.Errorf("err"))
 				db.shardSet.InsertShard(models.ShardID(1), mockShard)
 				gomock.InOrder(
-					metadata.EXPECT().Close().Return(nil),
-					storeMgr.EXPECT().CloseStore("metaStore").Return(nil),
+					memMetaDB.EXPECT().Close(),
+					metaDB.EXPECT().Close().Return(nil),
 					mockShard.EXPECT().Close().Return(fmt.Errorf("err")),
 				)
 			},
@@ -371,16 +331,16 @@ func TestDatabase_FlushMeta(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	metadata := metadb.NewMockMetadata(ctrl)
+	metaDB := memdb.NewMockMetadataDatabase(ctrl)
 	db := &database{
-		metadata:       metadata,
+		memMetaDB:      metaDB,
 		flushCondition: sync.NewCond(&sync.Mutex{}),
 		isFlushing:     *atomic.NewBool(false),
 		statistics:     metrics.NewDatabaseStatistics("test"),
 	}
 	cases := []struct {
-		name    string
 		prepare func()
+		name    string
 		wantErr bool
 	}{
 		{
@@ -394,7 +354,10 @@ func TestDatabase_FlushMeta(t *testing.T) {
 			name: "flush meta failure",
 			prepare: func() {
 				db.isFlushing.Store(false)
-				metadata.EXPECT().Flush().Return(fmt.Errorf("err"))
+				metaDB.EXPECT().Notify(gomock.Any()).DoAndReturn(func(event any) {
+					mn := event.(*memdb.FlushEvent)
+					mn.Callback(fmt.Errorf("err"))
+				})
 			},
 			wantErr: true,
 		},
@@ -402,7 +365,10 @@ func TestDatabase_FlushMeta(t *testing.T) {
 			name: "flush meta successfully",
 			prepare: func() {
 				db.isFlushing.Store(false)
-				metadata.EXPECT().Flush().Return(nil)
+				metaDB.EXPECT().Notify(gomock.Any()).DoAndReturn(func(event any) {
+					mn := event.(*memdb.FlushEvent)
+					mn.Callback(nil)
+				})
 			},
 			wantErr: false,
 		},
@@ -470,18 +436,19 @@ func TestDatabase_WaitFlushMetaCompleted(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	now := timeutil.Now()
-	metadata := metadb.NewMockMetadata(ctrl)
+	now := commontimeutil.Now()
+	metaDB := memdb.NewMockMetadataDatabase(ctrl)
 	db := &database{
-		metadata:       metadata,
+		memMetaDB:      metaDB,
 		isFlushing:     *atomic.NewBool(false),
 		flushCondition: sync.NewCond(&sync.Mutex{}),
 		statistics:     metrics.NewDatabaseStatistics("test"),
 	}
 
-	metadata.EXPECT().Flush().DoAndReturn(func() error {
+	metaDB.EXPECT().Notify(gomock.Any()).DoAndReturn(func(event any) {
 		time.Sleep(100 * time.Millisecond)
-		return nil
+		mn := event.(*memdb.FlushEvent)
+		mn.Callback(nil)
 	})
 	var wait sync.WaitGroup
 	wait.Add(2)
@@ -502,40 +469,44 @@ func TestDatabase_WaitFlushMetaCompleted(t *testing.T) {
 		wait.Done()
 	}()
 	wait.Wait()
-	assert.True(t, timeutil.Now()-now >= 100*time.Millisecond.Milliseconds())
+	assert.True(t, commontimeutil.Now()-now >= 100*time.Millisecond.Milliseconds())
 }
 
 func TestDatabase_Drop(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer func() {
 		removeDir = fileutil.RemoveDir
-		kv.InitStoreManager(nil)
 		ctrl.Finish()
 	}()
-	storeMgr := kv.NewMockStoreManager(ctrl)
-	kv.InitStoreManager(storeMgr)
-	storeMgr.EXPECT().CloseStore(gomock.Any()).Return(nil).AnyTimes()
-	metadata := metadb.NewMockMetadata(ctrl)
-	store := kv.NewMockStore(ctrl)
+	metaDB := memdb.NewMockMetadataDatabase(ctrl)
+	mDB := index.NewMockMetricMetaDatabase(ctrl)
 	db := &database{
-		metadata:       metadata,
-		metaStore:      store,
+		memMetaDB:      metaDB,
+		metaDB:         mDB,
 		shardSet:       *newShardSet(),
 		isFlushing:     *atomic.NewBool(false),
 		flushCondition: sync.NewCond(&sync.Mutex{}),
+		statistics:     metrics.NewDatabaseStatistics("test-drop"),
 	}
-	store.EXPECT().Name().Return("test").AnyTimes()
-	metadata.EXPECT().Close().Return(fmt.Errorf("err"))
+	// flush error
+	metaDB.EXPECT().Notify(gomock.Any()).DoAndReturn(func(event any) {
+		mn := event.(*memdb.FlushEvent)
+		mn.Callback(fmt.Errorf("err"))
+	})
 	assert.Error(t, db.Drop())
 	removeDir = func(path string) error {
 		return fmt.Errorf("err")
 	}
-	metadata.EXPECT().Close().Return(nil)
+	metaDB.EXPECT().Notify(gomock.Any()).DoAndReturn(func(event any) {
+		mn := event.(*memdb.FlushEvent)
+		mn.Callback(nil)
+	}).MaxTimes(2)
+	mDB.EXPECT().Close().Return(nil).MaxTimes(2)
+	metaDB.EXPECT().Close().MaxTimes(2)
 	assert.Error(t, db.Drop())
 	removeDir = func(path string) error {
 		return nil
 	}
-	metadata.EXPECT().Close().Return(nil)
 	assert.NoError(t, db.Drop())
 }
 
@@ -634,9 +605,7 @@ func Benchmark_MapWithoutLock(b *testing.B) {
 	})
 }
 
-var (
-	boundaryShardSetLen = 20
-)
+var boundaryShardSetLen = 20
 
 func Benchmark_ShardSet_iterating(b *testing.B) {
 	set := newShardSet()

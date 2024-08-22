@@ -68,12 +68,16 @@ var (
 	// ErrEmptySelectList represents empty select list.
 	ErrEmptySelectList = errors.New("select item list is empty")
 
+	// ErrPartitionClosed represents paritition is already closed.
+	ErrPartitionClosed = errors.New("partition is closed")
+
 	ErrDatabaseNotExist       = errors.New("database not exist")
 	ErrNoAvailableStorageNode = errors.New("no available storage node for server")
 
 	// ErrTooManySeries represents the series be limited.
-	ErrTooManySeries     = errors.New("too manay series")
-	ErrTooManyMetadata   = errors.New("too manay namespace or metric")
+	ErrTooManySeries     = errors.New("too many series")
+	ErrTooManyNamespace  = errors.New("too many namespace")
+	ErrTooManyMetric     = errors.New("too many metric name")
 	ErrNamespaceTooLong  = errors.New("namespace is too long")
 	ErrMetricNameTooLong = errors.New("metric name is too long")
 	ErrFieldNameTooLong  = errors.New("field name is too long")

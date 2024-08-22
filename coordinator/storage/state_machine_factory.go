@@ -20,10 +20,11 @@ package storage
 import (
 	"context"
 
+	"github.com/lindb/common/pkg/logger"
+
 	"github.com/lindb/lindb/constants"
 	"github.com/lindb/lindb/coordinator/discovery"
 	"github.com/lindb/lindb/models"
-	"github.com/lindb/lindb/pkg/logger"
 )
 
 // StateMachinePaths represents the paths which storage state machine need watch.
@@ -31,7 +32,7 @@ var StateMachinePaths = make(map[string]models.StateMachineInfo)
 
 func init() {
 	StateMachinePaths[constants.LiveNode] = models.StateMachineInfo{
-		Path: constants.LiveNodesPath,
+		Path: constants.StorageLiveNodesPath,
 		CreateState: func() interface{} {
 			return &models.StatefulNode{}
 		},
@@ -39,7 +40,7 @@ func init() {
 	StateMachinePaths[constants.ShardAssignment] = models.StateMachineInfo{
 		Path: constants.ShardAssignmentPath,
 		CreateState: func() interface{} {
-			return &models.DatabaseAssignment{}
+			return &models.ShardAssignment{}
 		},
 	}
 }
@@ -49,10 +50,8 @@ type StateMachineFactory struct {
 	ctx              context.Context
 	discoveryFactory discovery.Factory
 	stateMgr         StateManager
-
-	stateMachines []discovery.StateMachine
-
-	logger *logger.Logger
+	logger           logger.Logger
+	stateMachines    []discovery.StateMachine
 }
 
 // NewStateMachineFactory creates a StateMachineFactory instance.
@@ -122,7 +121,7 @@ func (f *StateMachineFactory) createStorageLiveNodeStateMachine() (discovery.Sta
 		f.ctx,
 		discovery.LiveNodeStateMachine,
 		f.discoveryFactory,
-		constants.LiveNodesPath,
+		constants.StorageLiveNodesPath,
 		true,
 		f.onNodeStartup,
 		f.onNodeFailure,

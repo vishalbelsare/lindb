@@ -18,14 +18,13 @@
 package strutil
 
 import (
-	"reflect"
 	"strings"
 	"unsafe"
 )
 
 // GetStringValue aggregation format function name
 func GetStringValue(rawString string) string {
-	if len(rawString) > 0 {
+	if rawString != "" {
 		if (strings.HasPrefix(rawString, "'") && strings.HasSuffix(rawString, "'")) ||
 			(strings.HasPrefix(rawString, "\"") && strings.HasSuffix(rawString, "\"")) {
 			return rawString[1 : len(rawString)-1]
@@ -36,24 +35,11 @@ func GetStringValue(rawString string) string {
 }
 
 func ByteSlice2String(bytes []byte) string {
-	p := unsafe.Pointer((*reflect.SliceHeader)(unsafe.Pointer(&bytes)).Data)
-
-	var s string
-	hdr := (*reflect.StringHeader)(unsafe.Pointer(&s))
-	hdr.Data = uintptr(p)
-	hdr.Len = len(bytes)
-	return s
+	return unsafe.String(&bytes[0], len(bytes))
 }
 
 func String2ByteSlice(str string) []byte {
-	p := unsafe.Pointer((*reflect.StringHeader)(unsafe.Pointer(&str)).Data)
-
-	var b []byte
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-	hdr.Data = uintptr(p)
-	hdr.Cap = len(str)
-	hdr.Len = len(str)
-	return b
+	return unsafe.Slice(unsafe.StringData(str), len(str))
 }
 
 // DeDupStringSlice removes the duplicated string in a list
@@ -61,11 +47,11 @@ func DeDupStringSlice(items []string) []string {
 	if len(items) == 0 {
 		return nil
 	}
-	var m = make(map[string]struct{})
+	m := make(map[string]struct{})
 	for _, item := range items {
 		m[item] = struct{}{}
 	}
-	var dst = make([]string, len(m))
+	dst := make([]string, len(m))
 	idx := 0
 	for k := range m {
 		dst[idx] = k
